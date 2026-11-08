@@ -1,0 +1,26 @@
+{
+ "schema": "repo-wiki-local/1",
+ "repoId": ".",
+ "language": "zh-CN",
+ "pages": [
+  {
+   "id": "overview",
+   "title": "总览",
+   "order": 1,
+   "description": "repo-wiki 构建器 fixture 总览页",
+   "filePaths": ["sample.py"],
+   "sources": [{"path": "sample.py", "startLine": 4}],
+   "markdown": "# 总览\n\n示例函数在 `sample.py:4` 与 `sample.py:8`。\n\n- 引用机检应全部可解析\n- 站点应零外链\n"
+  },
+  {
+   "id": "builder",
+   "parentId": "overview",
+   "title": "构建器",
+   "order": 2,
+   "description": "构建器子页",
+   "filePaths": [],
+   "sources": [],
+   "markdown": "# 构建器\n\n```\npython3 build_wiki_site.py build --wiki <dir>\n```\n"
+  }
+ ]
+}

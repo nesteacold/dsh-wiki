@@ -1,0 +1,12 @@
+{
+ "schema": "repo-wiki-local/1",
+ "repoId": ".",
+ "language": "zh-CN",
+ "pages": [
+  {
+   "id": "rel",
+   "title": "相对 repoId",
+   "markdown": "# 相对 repoId\n\nrepoId 相对时以 wiki 目录为基准解析：引用 `notes.md:2` 在任意 CWD 下都应可解析。\n"
+  }
+ ]
+}

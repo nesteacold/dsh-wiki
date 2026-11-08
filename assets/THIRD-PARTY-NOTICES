@@ -1,0 +1,12 @@
+# Third-party notices — repo-wiki
+
+本目录的 `mermaid.min.js` 是第三方构建产物（Mermaid 11，esbuild 打包，含下列组件的内嵌许可声明），
+仅用于站点离线内联渲染，不修改其内容。
+
+- **Mermaid** — MIT License — https://github.com/mermaid-js/mermaid
+- **DOMPurify** — Apache License 2.0 与 Mozilla Public License 2.0 双许可 — https://github.com/cure53/DOMPurify
+- **Lodash** — MIT License — https://github.com/lodash/lodash
+- 其余按 bundle 内 `@license` / `Copyright` 行内注释为准（`grep -o '@license[^*]*' assets/mermaid.min.js` 可复核）。
+
+本插件自身代码为 MIT（随插件分发：`repo-wiki/LICENSE`，仓库根亦有同名文件）。第三方组件的许可条款以其各自声明为准；
+如需替换/升级该 bundle，请同步更新本文件。

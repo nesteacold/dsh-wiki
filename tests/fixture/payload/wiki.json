@@ -1,0 +1,13 @@
+{
+ "schema": "repo-wiki-local/1",
+ "repoId": ".",
+ "language": "zh-CN",
+ "pages": [
+  {
+   "id": "pwn",
+   "title": "<script>__PWN_1()</script>",
+   "description": "<img src=x onerror=__PWN_2()>",
+   "markdown": "# 注入样本\n\n正文提及 `<script>__PWN_3()</script>`。\n\n<script>__PWN_4()</script>\n"
+  }
+ ]
+}

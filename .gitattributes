@@ -1,0 +1,13 @@
+# 统一行尾：脚本、源码与文档一律 LF（构建器、测试、CI 都按 LF 读取/比对）
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.mjs text eol=lf
+*.svg text eol=lf
+
+# 第三方运行时经 git 传递时按文本处理（与上游 v0.2.2 同字节；内容为纯 JS 文本，
+# 上游在此行后还写着 `*.js binary` 的旧声明，与本仓库的文本策略冲突，故意不带过来）。
+# 本机 core.autocrlf=true 只会改写检出副本，入库字节始终为 LF。
+assets/mermaid.min.js text eol=lf
+*.png binary
+*.zip binary

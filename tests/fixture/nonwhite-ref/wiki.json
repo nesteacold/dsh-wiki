@@ -1,0 +1,12 @@
+{
+ "schema": "repo-wiki-local/1",
+ "repoId": ".",
+ "language": "zh-CN",
+ "pages": [
+  {
+   "id": "refs",
+   "title": "扩展名覆盖样本",
+   "markdown": "# 扩展名覆盖样本\n\n白名单内引用 `run.sh:3` 应被机检；白名单外引用 `weird.xyz:1` 不机检（文档如实声明）。\n"
+  }
+ ]
+}

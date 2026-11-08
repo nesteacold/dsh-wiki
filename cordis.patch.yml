@@ -1,0 +1,10 @@
+# dsh-wiki：为 profile 追加本插件的一个 loader 行。
+# 安装 = `dsh plugin --profile <name> add @dsh-ext/dsh-wiki`（自动把本包追加进 dsh.profile.bundles）。
+- insert:
+    - id: dsh-wiki
+      name: "@dsh-ext/dsh-wiki"
+      config:
+        # 各仓库内 wiki 产物目录名（仓库相对）
+        wikiDirName: .dsh-wiki
+        # 额外扫描的 wiki 根目录（绝对路径数组；会话工作区及其同级目录会被自动发现，无需手填）
+        wikiRoots: []
