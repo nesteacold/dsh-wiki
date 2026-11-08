@@ -16,9 +16,9 @@ dsh-wiki 的构建器、查看器与你看到的站点产物都来自 [zcode-rep
 | 同上，sha256（LF 文本，70441 字节） | `e5fbac1ecd83c643b1776f095eae3608e17a0aec82cfb0f3456ab574cb5b895f` |
 | 同上，sha256（对工作区检出的 CRLF 副本，132612 字节） | `f8aea8fea1e89d8aba77d62a47cfa363a32205c70c516803d3182457906c10e7` |
 | 同上，本仓库当前文件 sha256 | `a4b119fed8d5a5fdef63979a7722c0fbdecc7d569d1361862afed8d868db1c4c`（73942 字节） |
-| 归档副本 | `plugins/_upstream/zcode-repo-wiki`（仅作参照，勿改） |
+| 归档副本 | `../_upstream/zcode-repo-wiki`（仅作参照，勿改） |
 
-核对基线文件（任意平台，在 `plugins/_upstream/zcode-repo-wiki` 下）：
+核对基线文件（任意平台，在 `../_upstream/zcode-repo-wiki` 下）：
 
 ```bash
 git rev-parse v0.2.2^{commit}                     # 74ce9f4b…
@@ -78,11 +78,11 @@ BOM，算出来的哈希对不上；一律用 `git cat-file` 重定向到文件�
 
 ## 变更流程（把上游改动并进来）
 
-1. 取上游新 tag，更新归档副本：`git -C plugins/_upstream/zcode-repo-wiki fetch --tags`。
+1. 取上游新 tag，更新归档副本：`git -C ../_upstream/zcode-repo-wiki fetch --tags`。
 2. 生成逐行差异（EOL 归一后再比，否则整份文件都会被判为改动）：
    ```bash
-   git -C plugins/_upstream/zcode-repo-wiki log --oneline v0.2.2..<新tag>
-   git diff --no-index -U2 <(git -C plugins/_upstream/zcode-repo-wiki show <新tag>:repo-wiki/scripts/build_wiki_site.py) \
+   git -C ../_upstream/zcode-repo-wiki log --oneline v0.2.2..<新tag>
+   git diff --no-index -U2 <(git -C ../_upstream/zcode-repo-wiki show <新tag>:repo-wiki/scripts/build_wiki_site.py) \
                           plugins/dsh-wiki/scripts/build_wiki_site.py
    ```
 3. 只拣与上面四类无关的上游改动（即"上游修 bug / 加功能"的那些 hunk），逐 hunk 应用；每处
