@@ -91,6 +91,8 @@ Local routes (loopback on the desktop host):
 
 **Migrating from ZCode**: say "import the legacy wiki" — `import-legacy` converts [zcode-repo-wiki](https://github.com/Acfufu/zcode-repo-wiki) data (`~/.zcode/v2/repo-wiki/<hash>`) in one step; the `wiki.json` schema is fully compatible.
 
+**Knowledge cards (0.2.0)**: besides pages, a wiki may carry short atomic cards (module / concept / API) with machine-checked `path:line` evidence, shown as a filterable card grid, per-card views and in search; pages link to them with `[text](#card-<id>)`. Write `pages/*.md` + `cards/*.md` with front-matter and run `build_wiki_site.py assemble` to produce `wiki.json`.
+
 ## ⚔️ vs Community Alternatives
 
 | | dsh-wiki | dsh-openwiki | dsh-plugin-codemap | archify |

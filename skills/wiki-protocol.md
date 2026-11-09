@@ -14,13 +14,14 @@
 `find ~/.dsh/profiles -path '*dsh-wiki*' -name build_wiki_site.py 2>/dev/null | sort -V | tail -1` 定位，取最新版本目录）。
 纯 Python3 标准库（要求 Python ≥3.7），无第三方依赖，无网络行为。输出流约定：数据（配置 JSON、构建/自检报告）走 stdout；诊断、警告与状态提示走 stderr。
 
-四个子命令：
+五个子命令：
 
 ```bash
 python3 build_wiki_site.py build          --wiki <.dsh-wiki目录>   # 由 wiki.json 构建自包含 site/index.html
 python3 build_wiki_site.py resolve-config --repo <仓库路径> [--set k=v …] [--dry-run]  # 多层合并生成配置；--dry-run 只打印不落盘
 python3 build_wiki_site.py import-legacy  <hash|绝对路径> [--dest <dir>]  # 导入 ZCode repo-wiki 存量 ~/.zcode/v2/repo-wiki/<hash>（构建但不自检）
-python3 build_wiki_site.py selfcheck      --wiki <.dsh-wiki目录>   # 树完整性 + 零外链 + 引用可解析性，exit 0/1
+python3 build_wiki_site.py selfcheck      --wiki <.dsh-wiki目录>   # 树完整性 + 零外链 + 引用可解析性（含卡片证据），exit 0/1
+python3 build_wiki_site.py assemble       --wiki <.dsh-wiki目录> [--repo <仓库绝对路径>] [--title T] [--language L]  # pages/*.md（+cards/*.md）front-matter → wiki.json
 ```
 
 `--set` 支持点路径下钻对象字段（如 `--set pages.max=24`）；列表字段（如 `wordsPerPage`）不支持下标，需整体赋值（`--set 'wordsPerPage=[300,600]'`）。未知配置键会被拒绝（非静默忽略）。
@@ -72,19 +73,27 @@ python3 build_wiki_site.py selfcheck      --wiki <.dsh-wiki目录>   # 树完整
 ### Phase 3 逐页写作
 - 每页字数取 `wordsPerPage` 区间 + 要点列表；开头 2–3 句回答"这页讲什么、读完能干什么"。
 - 图表策略取 `diagrams`：`minimal`/`rich` 下架构、数据流、模块边界类页面**必须有 1 张图**（优先内联 SVG——自包含、风格可控，参考线框+配色克制；也可用 mermaid 代码块，查看器内置离线渲染）；`rich` 时其余核心页也应配图；`none` 时不配图。内联 SVG 会被构建器按 XML 解析器白名单净化：删除脚本/事件属性/外部 URL（`href`/`src` 仅保留 `#片段` 与 `data:image/*;base64` 内联图；`fill="url(...)"` 类属性只保留 `#片段` 目标），**`<style>` 元素、`style` 属性与 SMIL `<animate>` 一律移除**（裸 CSS 与动画可改写 URL 指向外链，无法穷尽校验；样式请用呈现属性如 `fill="#0a7"`、`stroke`、`opacity` 表达）；不可解析（含 DOCTYPE/ENTITY、超 2MB、超深嵌套）则降级为转义代码块。
-- 引用策略取 `citations`：`strict` 时每个论断尽量带 `` `仓库相对路径:行号` ``，关键代码点必须带；`relaxed` 至少给出涉及的文件路径。跨页引用直接写页面标题。selfcheck 会机检 `` `path:line` `` 引用（文件存在 + 行号在界内），引用不存在或越界 = 生成失败。机检覆盖常见代码/配置扩展名（见脚本 `_REF_EXTS` 白名单，含 .ts/.js/.py/.go/.sh/.md/.json/.yml 等）；白名单外扩展名的引用不做机检，写作时应自觉保证真实。
+- 引用策略取 `citations`：`strict` 时每个论断尽量带 `` `仓库相对路径:行号` ``，关键代码点必须带；`relaxed` 至少给出涉及的文件路径。跨页引用直接写页面标题。selfcheck 会机检 `` `path:line` `` 引用（文件存在 + 行号在界内），引用不存在或越界 = 生成失败；行号在界内但指向空行会报 WARN（通常是行号偏移），出现即逐条复核修正。机检覆盖常见代码/配置扩展名（见脚本 `_REF_EXTS` 白名单，含 .ts/.js/.py/.go/.sh/.md/.json/.yml 等）；白名单外扩展名的引用不做机检，写作时应自觉保证真实。
 - 面向"接手的人"：讲清不变量、坑、为什么这样设计，而不是复述目录名。
+
+### Phase 3b 知识卡片（可选，推荐）
+- 页面写完后，为关键**模块 / 概念 / API** 各写一张原子卡片，建议 10–40 张（超过 200 张构建器会告警）。
+- 字段：`id`（短横线小写）、`title`、`kind`（`module` | `concept` | `api`）、`summary`（**纯文本** 1–3 句，≤400 字符；不支持 markdown/HTML/SVG，一律按文本转义显示）、`keyFiles`（1–8 个 `仓库相对路径[:行号]`，与页面引用同一道机检）、`related`（其它卡片 id）、`tags`、`pageIds`（主要讲解它的页面 id）。
+- 页面正文用标准链接指向卡片：`[文本](#card-<id>)`；目标不存在时构建器降级为纯文本并告警。
+- 卡片存放在 `wiki.json` 顶层 `cards` 数组（schema 不变）；用 `assemble` 时写成 `cards/<id>.md`：front-matter 放字段，正文即 summary。
 
 ### Phase 4 落盘与构建
 产物写到 `<仓库>/.dsh-wiki/`：
-- `wiki.json`：`{"schema":"repo-wiki-local/1","repoId":"<绝对路径>","title":"<可选，站点品牌位显示名>","language":"…","generatedBy":"agent","pages":[{id,parentId,title,order,description,filePaths,markdown}]}`（markdown 内嵌，作为唯一事实源）。顶层 `title` 只影响站点品牌位显示（缺省回落到 `repoId`）；引用机检的仓库根始终取 `repoId`，与显示名无关。
+- `wiki.json`：`{"schema":"repo-wiki-local/1","repoId":"<绝对路径>","title":"<可选，站点品牌位显示名>","language":"…","generatedBy":"agent","pages":[{id,parentId,title,order,description,filePaths,markdown}],"cards":[{id,title,kind,summary,keyFiles,related,tags,pageIds}]}`（`cards` 可选）（markdown 内嵌，作为唯一事实源）。顶层 `title` 只影响站点品牌位显示（缺省回落到 `repoId`）；引用机检的仓库根始终取 `repoId`，与显示名无关。
 - `generation-meta.json`：Phase 0.5 由 resolve-config 写入，记录生效配置与 provenance，留档复现。
 - `pages/<id>.md`：每页一份导出（便于人读和 diff），构建以 wiki.json 为准。
+- 推荐写法：先写 `pages/<id>.md`（front-matter：`id`、`parentId`、`order`、`title`、`description`、`filePaths`，值可写 JSON，如 `filePaths: ["a.py"]`、`parentId: null`）与可选 `cards/<id>.md`，再运行 `assemble --repo <仓库绝对路径> --language <lang>` 生成/更新 wiki.json（保留其它顶层键；无 `cards/` 目录时沿用已有 cards），避免手写嵌入 markdown 的 JSON。
+- `resolve-config` 会把仓库 `git rev-parse HEAD` 记录为 generation-meta 的 `sourceCommit`（非 git 仓库则省略）。
 - 然后 `build` + `selfcheck`，两者必须全绿。
 
 ### Phase 5 汇报
 - 输出：site/index.html 绝对路径、页数、目录树摘要、以及"未覆盖/待确认"清单。
-- 本插件把站点挂在本机 DSH 宿主上：向用户同时给出 **`/dsh-wiki/site?path=<site 目录绝对路径>`** 这一相对 URL（说明它挂在 DSH 本机宿主端口上，可直接点击打开），以及磁盘路径。
+- 本插件把站点挂在本机 DSH 宿主上：向用户同时给出 **`/dsh-wiki/site?path=<.dsh-wiki 目录绝对路径>`** 这一相对 URL（注意 path 是 `.dsh-wiki` 目录本身，不是其下的 `site/` 目录——路由要求目录名等于 `wikiDirName`，传 `site/` 会被拒 403；说明它挂在 DSH 本机宿主端口上，可直接点击打开），以及磁盘路径。
 
 ## 子命令二：import-legacy <hash|绝对路径>
 

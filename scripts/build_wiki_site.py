@@ -6,6 +6,7 @@
   import-legacy  <hash|path> [--dest <dir>]         导入旧版 ~/.zcode/v2/repo-wiki/<hash> 并构建（不自动自检）
   selfcheck      --wiki <dir>                       树完整性 + 零外链 + 引用机检 (exit 0/1)
   resolve-config --repo <path> [--set K=V …] [--dry-run]  三层合并生成配置并落 generation-meta.json
+  assemble       --wiki <dir> [--repo P] [--title T] [--language L]  pages/*.md + cards/*.md → wiki.json
 
 约定：WARN/FAIL 诊断走 stderr，数据/报告走 stdout。
 """
@@ -28,6 +29,9 @@ MERMAID_PATH = Path(__file__).resolve().parent.parent / "assets" / "mermaid.min.
 # ---------------------------------------------------------------- markdown
 
 _MAX_MD_DEPTH = 16
+# 构建期上下文：本 wiki 的卡片 id 集合（None = 无卡片，链接按旧行为渲染）与断链收集
+_CARD_LINKS = None
+_CARD_LINK_WARNS: list = []
 
 
 def _inline(s: str) -> str:
@@ -43,6 +47,16 @@ def _inline(s: str) -> str:
     s = html.escape(s, quote=True)
     s = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)",
                lambda m: f'<span class="imgref" title="{m.group(2)}">🖼 {m.group(1) or "图片"}（离线查看器不加载外部图片）</span>', s)
+    if _CARD_LINKS is not None:
+        # 知识卡片链接 [文本](#card-<id>)：仅当本 wiki 有卡片时才变成站内锚点；
+        # 目标不存在则降级为纯文本并告警。id 字符集受限，href 不可能携带外链。
+        def _cardlink(m):
+            cid = m.group(2)
+            if cid in _CARD_LINKS:
+                return f'<a class="cardlink" href="#card-{cid}">{m.group(1)}</a>'
+            _CARD_LINK_WARNS.append(cid)
+            return m.group(1)
+        s = re.sub(r"\[([^\]]+)\]\(#card-([A-Za-z0-9_-]+)\)", _cardlink, s)
     s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)",
                lambda m: f'<span class="linkref" title="{m.group(2)}">{m.group(1)}</span>', s)
     s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
@@ -513,6 +527,185 @@ def _page_section(p) -> str:
             f'<div class="content">{body}</div></section>')
 
 
+# ---------------------------------------------------------------- knowledge cards
+# 卡片是可选的原子知识单元（spec 004）：只接受纯文本，全部 html.escape，不走
+# markdown/SVG 渲染路径；无卡片时站点输出与旧版逐字节一致（时间戳除外）。
+
+CARD_KINDS = ("module", "concept", "api")
+CARD_KIND_LABEL = {"module": "模块", "concept": "概念", "api": "API"}
+_CARD_SUMMARY_MAX = 400
+_CARD_KEYFILES_MAX = 8
+_CARD_WARN_COUNT = 200
+_CARD_KEYFILE_RE = re.compile(r"^[A-Za-z0-9._\-/]+(?::\d+(?:-\d+)?)?$")
+
+
+def normalize_cards(raw_cards, page_ids, warns=None):
+    """清洗 wiki.json.cards：非法条目丢弃并告警，断链 related/pageIds 丢弃并告警。"""
+    warns = warns if warns is not None else []
+    if raw_cards is None:
+        return []
+    if not isinstance(raw_cards, list):
+        warns.append(f"cards 不是数组（{type(raw_cards).__name__}），已忽略全部卡片")
+        return []
+    used = set()
+    page_ids = set(page_ids)
+    cards = []
+    for idx, c in enumerate(raw_cards):
+        if not isinstance(c, dict):
+            warns.append(f"cards[{idx}] 不是对象（{type(c).__name__}），已跳过")
+            continue
+        raw_id = c.get("id") if c.get("id") is not None else c.get("title")
+        if raw_id is None or not str(raw_id).strip():
+            warns.append(f"cards[{idx}] 缺 id 与 title，已跳过")
+            continue
+        raw_id = str(raw_id)
+        if raw_id == "grid":
+            raw_id = "grid-card"
+            warns.append(f"cards[{idx}] id 'grid' 为保留字，已改为 grid-card")
+        before = set(used)
+        cid = _safe_id(raw_id, used)
+        # 冲突检查必须在清洗/去重之后：去重后缀（如 x-2）也可能撞上页面 id card-x-2
+        if f"card-{cid}" in page_ids or cid == "grid":
+            warns.append(f"卡片 {raw_id} 的锚点 card-{cid} 与页面 id 或保留锚点冲突，已跳过")
+            used.discard(cid)
+            continue
+        if cid != re.sub(r"[^A-Za-z0-9_-]", "-", raw_id) or raw_id in before:
+            warns.append(f"卡片 id {raw_id!r} 已清洗/去重为 {cid}")
+        title = _clean_text(str(c.get("title") or cid)).strip() or cid
+        kind = c.get("kind")
+        if kind not in CARD_KINDS:
+            if kind is not None:
+                warns.append(f"卡片 {cid} 的 kind {kind!r} 非法，已置为 concept")
+            kind = "concept"
+        summary = c.get("summary")
+        summary = _clean_text(summary if isinstance(summary, str) else ("" if summary is None else str(summary)))
+        summary = " ".join(summary.split())
+        if len(summary) > _CARD_SUMMARY_MAX:
+            warns.append(f"卡片 {cid} 的 summary 超过 {_CARD_SUMMARY_MAX} 字符，已截断")
+            summary = summary[:_CARD_SUMMARY_MAX - 1] + "…"
+        key_files = []
+        for kf in _as_str_list(c.get("keyFiles")):
+            kf = kf.strip()
+            path_part = kf.split(":", 1)[0]
+            if _CARD_KEYFILE_RE.match(kf) and not path_part.startswith("/") \
+                    and ".." not in path_part.split("/"):
+                key_files.append(kf)
+            else:
+                warns.append(f"卡片 {cid} 的 keyFiles 条目 {kf!r} 非法（需 仓库相对路径[:行号]），已丢弃")
+        if len(key_files) > _CARD_KEYFILES_MAX:
+            warns.append(f"卡片 {cid} 的 keyFiles 超过 {_CARD_KEYFILES_MAX} 个，已截断")
+            key_files = key_files[:_CARD_KEYFILES_MAX]
+        if not key_files:
+            warns.append(f"卡片 {cid} 没有合法 keyFiles（至少 1 个证据），已跳过")
+            used.discard(cid)
+            continue
+        cards.append({
+            "id": cid, "title": title, "kind": kind, "summary": summary,
+            "keyFiles": key_files,
+            "related": [str(x) for x in _as_str_list(c.get("related"))],
+            "tags": list(dict.fromkeys(re.sub(r"\s+", "-", t.strip()) for t in _as_str_list(c.get("tags")) if t.strip()))[:12],
+            "pageIds": [str(x) for x in _as_str_list(c.get("pageIds"))],
+        })
+    ids = {c["id"] for c in cards}
+    for c in cards:
+        bad = [r for r in c["related"] if r not in ids or r == c["id"]]
+        if bad:
+            warns.append(f"卡片 {c['id']} 的 related 指向不存在的卡片 {', '.join(bad[:5])}，已移除")
+        c["related"] = [r for r in dict.fromkeys(c["related"]) if r in ids and r != c["id"]]
+        badp = [p for p in c["pageIds"] if p not in page_ids]
+        if badp:
+            warns.append(f"卡片 {c['id']} 的 pageIds 指向不存在的页面 {', '.join(badp[:5])}，已移除")
+        c["pageIds"] = [p for p in dict.fromkeys(c["pageIds"]) if p in page_ids]
+    if len(cards) > _CARD_WARN_COUNT:
+        warns.append(f"卡片数 {len(cards)} 超过 {_CARD_WARN_COUNT}（建议 10–40），站点可能变大变慢")
+    return cards
+
+
+def _card_pages_linking(cards, pages):
+    """卡片 id → 引用它的页面 id 列表（pageIds 声明 ∪ 页面正文里的 #card-<id> 链接）。"""
+    refs = {c["id"]: list(c["pageIds"]) for c in cards}
+    for p in pages:
+        for cid in re.findall(r"\]\(#card-([A-Za-z0-9_-]+)\)", p.get("markdown") or ""):
+            if cid in refs and p["id"] not in refs[cid]:
+                refs[cid].append(p["id"])
+    return refs
+
+
+def _card_tile(c) -> str:
+    tags = "".join(f'<span class="ctag">{html.escape(t)}</span>' for t in c["tags"])
+    return (f'<a class="ctile" href="#card-{c["id"]}" data-kind="{c["kind"]}" '
+            f'data-tags="{html.escape(" ".join(c["tags"]), quote=True)}">'
+            f'<span class="ckind k-{c["kind"]}">{CARD_KIND_LABEL[c["kind"]]}</span>'
+            f'<b>{html.escape(c["title"])}</b><span class="csum">{html.escape(c["summary"])}</span>'
+            f'<span class="ctags">{tags}</span></a>')
+
+
+def _cards_html(cards, pages) -> str:
+    by_page = {p["id"]: p for p in pages}
+    by_card = {c["id"]: c for c in cards}
+    refs = _card_pages_linking(cards, pages)
+    tags = sorted({t for c in cards for t in c["tags"]}, key=str.casefold)
+    kinds = [k for k in CARD_KINDS if any(c["kind"] == k for c in cards)]
+    btns = ['<button class="cfilt on" data-f="">全部</button>']
+    btns += [f'<button class="cfilt" data-f="k:{k}">{CARD_KIND_LABEL[k]}</button>' for k in kinds]
+    btns += [f'<button class="cfilt" data-f="t:{html.escape(t, quote=True)}">#{html.escape(t)}</button>'
+             for t in tags[:40]]
+    grid = (f'<section class="page" id="pg-card-grid" hidden><h1>知识卡片</h1>'
+            f'<p class="desc">{len(cards)} 张卡片：模块、概念与 API 的原子速览，每张都带可机检的证据。</p>'
+            f'<div class="cfilters">{"".join(btns)}</div>'
+            f'<div class="cgrid">{"".join(_card_tile(c) for c in cards)}</div></section>')
+    out = [grid]
+    for c in cards:
+        files = "".join(f"<li><code>{html.escape(f)}</code></li>" for f in c["keyFiles"])
+        rel = "".join(f'<li><a class="cardlink" href="#card-{r}">{html.escape(by_card[r]["title"])}</a></li>'
+                      for r in c["related"])
+        pg = "".join(f'<li><a class="navitem" data-page="{pid}" href="#{pid}">'
+                     f'{html.escape(by_page[pid]["title"])}</a></li>'
+                     for pid in refs[c["id"]] if pid in by_page)
+        tags_html = "".join(f'<span class="ctag">{html.escape(t)}</span>' for t in c["tags"])
+        parts = [f'<section class="page card" id="pg-card-{c["id"]}" hidden>',
+                 f'<p class="crumb"><a href="#card-grid">知识卡片</a> · '
+                 f'<span class="ckind k-{c["kind"]}">{CARD_KIND_LABEL[c["kind"]]}</span></p>',
+                 f'<h1>{html.escape(c["title"])}</h1>',
+                 f'<p class="csummary">{html.escape(c["summary"]) or "（无摘要）"}</p>',
+                 f'<div class="ctags">{tags_html}</div>' if tags_html else "",
+                 f'<h3>关键文件</h3><ul class="cfiles">{files}</ul>']
+        if rel:
+            parts.append(f'<h3>相关卡片</h3><ul>{rel}</ul>')
+        if pg:
+            parts.append(f'<h3>引用此卡片的页面</h3><ul>{pg}</ul>')
+        parts.append("</section>")
+        out.append("".join(parts))
+    return "\n".join(out)
+
+
+_CARD_CSS = """
+.cfilters{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}
+.cfilt{background:var(--chipbg);border:1px solid var(--border);border-radius:14px;color:var(--fg);cursor:pointer;font-size:12px;padding:2px 10px}
+.cfilt.on{border-color:var(--accent);color:var(--accent)}
+.cgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+.ctile{display:flex;flex-direction:column;gap:4px;border:1px solid var(--border);border-radius:10px;padding:12px;background:var(--panel);color:var(--fg);text-decoration:none;box-shadow:0 1px 2px var(--shadow)}
+.ctile:hover{border-color:var(--accent)}.ctile[hidden]{display:none}
+.ctile b{font-size:14px}.csum{color:var(--muted);font-size:12.5px;line-height:1.5}
+.ckind{align-self:flex-start;font-size:11px;border-radius:4px;padding:0 6px;background:var(--chipbg);color:var(--accent)}
+.ctags{display:flex;flex-wrap:wrap;gap:4px;margin:4px 0}.ctag{font-size:11px;color:var(--muted)}.ctag:before{content:"#"}
+.csummary{font-size:16px}.crumb{font-size:12.5px;color:var(--muted);margin:0 0 6px}
+.cardlink{color:var(--accent)}a.navcards{margin-top:6px;border-top:1px solid var(--border);border-radius:0;padding-top:8px}
+"""
+
+_CARD_JS = """
+document.addEventListener('click',function(e){
+  var b=e.target.closest('.cfilt');if(!b)return;
+  document.querySelectorAll('.cfilt').forEach(function(x){x.classList.toggle('on',x===b);});
+  var f=b.getAttribute('data-f')||'';
+  document.querySelectorAll('.ctile').forEach(function(t){
+    var ok=!f||(f.slice(0,2)==='k:'&&t.getAttribute('data-kind')===f.slice(2))||
+      (f.slice(0,2)==='t:'&&(' '+t.getAttribute('data-tags')+' ').indexOf(' '+f.slice(2)+' ')>=0);
+    t.hidden=!ok;});
+});
+"""
+
+
 # ---------------------------------------------------------------- template
 
 _TEMPLATE = """<!DOCTYPE html>
@@ -563,7 +756,7 @@ hr{border:0;border-top:1px solid var(--border);margin:22px 0}
 footer{margin-top:60px;color:var(--muted);font-size:12px}
 @media (prefers-reduced-motion:no-preference){.navitem,.chip{transition:background .15s}}
 @media (max-width:760px){body{flex-direction:column}aside{width:100%;min-width:0;height:auto;max-height:38vh;border-right:0;border-bottom:1px solid var(--border)}main{height:auto;max-width:none;padding:20px 16px 64px}}
-</style>
+__CARDCSS__</style>
 </head>
 <body>
 <aside>
@@ -571,11 +764,11 @@ footer{margin-top:60px;color:var(--muted);font-size:12px}
   <div id="repo">__REPO__</div>
   <input id="search" type="search" placeholder="全文搜索…" autocomplete="off">
   <div id="hits" hidden role="listbox"></div>
-  <nav id="tree">__TREE__</nav>
+  <nav id="tree">__TREE__</nav>__CARDNAV__
 </aside>
 <main id="main">
 <noscript><p class="todo">本查看器需要 JavaScript 才能切换页面与全文搜索；请在启用 JS 的浏览器中打开。</p></noscript>
-__PAGES__
+__PAGES____CARDS__
 <footer>dsh-wiki@local · 纯本地生成，零上传 · __DATE__</footer>
 </main>
 <script>__MERMAID__</script>
@@ -667,7 +860,7 @@ if(saved!=='dark'&&saved!=='light'){
 applyTheme(saved);
 var initial=location.hash.slice(1);
 show(initial);
-})();
+__CARDJS__})();
 </script>
 </body>
 </html>
@@ -763,6 +956,18 @@ def build_site(wiki_dir: Path) -> dict:
             print(f"[dsh-wiki] WARN {w}", file=sys.stderr)
         extra = f"（{len(warns)} 个页面元素非法或缺失，详见 WARN）" if warns else ""
         sys.exit(f"[dsh-wiki] {wiki_json} 中没有页面{extra}")
+    cards = normalize_cards(data.get("cards"), [p["id"] for p in pages], warns)
+    global _CARD_LINKS
+    _CARD_LINKS = {c["id"] for c in cards} if cards else None
+    _CARD_LINK_WARNS.clear()
+    try:
+        return _build_site_render(wiki_dir, data, pages, cards, warns)
+    finally:
+        # 卡片上下文是模块级状态：无论成功或 sys.exit 都要复位，避免泄漏到下一次构建
+        _CARD_LINKS = None
+
+
+def _build_site_render(wiki_dir: Path, data: dict, pages, cards, warns) -> dict:
     for w in warns:
         print(f"[dsh-wiki] WARN {w}", file=sys.stderr)
     sections, index = [], {}
@@ -786,6 +991,17 @@ def build_site(wiki_dir: Path) -> dict:
             "desc": p["description"],
             "text": html.unescape(_strip_tags(md_to_html(p["markdown"])))[:20000],
         }
+    for c in cards:
+        # 卡片与页面同处一个 INDEX；键带 card- 前缀，与页面 id 命名空间分开
+        index[f"card-{c['id']}"] = {
+            "title": f"[{CARD_KIND_LABEL[c['kind']]}卡片] {c['title']}",
+            "desc": c["summary"],
+            "text": " ".join([c["summary"], " ".join(c["tags"]), " ".join(c["keyFiles"])]),
+        }
+    if _CARD_LINK_WARNS:
+        missing = sorted(set(_CARD_LINK_WARNS))
+        print(f"[dsh-wiki] WARN {len(missing)} 个卡片链接目标不存在，按纯文本渲染: "
+              f"{', '.join(missing[:10])}", file=sys.stderr)
     # 品牌位显示名：可选 title 优先，其次 repoId（历史行为），最后落目录名。
     # repoId 仍是引用机检的仓库根，两者互不影响。
     title = _clean_text(str(data.get("title") or data.get("repoId") or wiki_dir.name))
@@ -808,6 +1024,12 @@ def build_site(wiki_dir: Path) -> dict:
         "__MERMAID__": _mermaid_runtime(),
         "__INDEX__": idx_literal,
         "__PAGES__": page_html,
+        # 无卡片时一律展开为空串：旧 wiki 的输出与 0.1.x 逐字节一致（时间戳除外）
+        "__CARDS__": ("\n" + _cards_html(cards, pages)) if cards else "",
+        "__CARDNAV__": (f'<ul><li><a class="navitem navcards" data-page="card-grid" href="#card-grid">'
+                        f'🗂 知识卡片（{len(cards)}）</a></li></ul>') if cards else "",
+        "__CARDCSS__": _CARD_CSS.lstrip("\n") if cards else "",
+        "__CARDJS__": _CARD_JS.lstrip("\n") if cards else "",
     }
     doc = re.sub(r"__[A-Z]+__", lambda m: mapping.get(m.group(0), m.group(0)), _TEMPLATE)
     unresolved = sorted(set(re.findall(r"__[A-Z]+__", _TEMPLATE)) - set(mapping))
@@ -820,7 +1042,7 @@ def build_site(wiki_dir: Path) -> dict:
         sys.exit(f"[dsh-wiki] 无法创建站点目录 {site}：{exc}")
     out = site / "index.html"
     _write_text(out, doc)
-    return {"pages": len(pages), "path": out.resolve(), "bytes": out.stat().st_size,
+    return {"pages": len(pages), "cards": len(cards), "path": out.resolve(), "bytes": out.stat().st_size,
             "mermaid": MERMAID_PATH.exists()}
 
 
@@ -1026,6 +1248,9 @@ def cmd_resolve(args):
             "profiles": profiles_used,
         },
     }
+    commit = _source_commit(repo)
+    if commit:
+        meta["sourceCommit"] = commit
     print(json.dumps(resolved, ensure_ascii=False, indent=2))
     for w in warns:
         print(f"[dsh-wiki] WARN {w}", file=sys.stderr)
@@ -1041,6 +1266,150 @@ def cmd_resolve(args):
     print(f"[dsh-wiki] 生效配置已写入 {out}（覆盖: {src_desc}）", file=sys.stderr)
     for w in warns:
         print(f"[dsh-wiki] WARN {w}", file=sys.stderr)
+
+
+def _source_commit(repo: Path):
+    """仓库当前 HEAD 的完整 sha（供 005 增量更新对比）；非 git 仓库/无 git 时返回 None。
+    只调用本地 `git rev-parse HEAD`，不联网、不读对象内容。"""
+    import subprocess
+    try:
+        p = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = p.stdout.strip()
+    return sha if p.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", sha) else None
+
+
+# ---------------------------------------------------------------- assemble
+
+_FM_KEYS_PAGE = ("id", "parentId", "order", "title", "description", "filePaths")
+_FM_KEYS_CARD = ("id", "title", "kind", "keyFiles", "related", "tags", "pageIds")
+
+
+def _parse_front_matter(text: str, label: str):
+    """极简 front-matter：首行 `---`，到下一个 `---` 为止；每行 `key: value`，
+    value 先按 JSON 解析（数组/数字/null/带引号字符串），失败则当作纯字符串。"""
+    text = text.replace("\r\n", "\n").lstrip("\ufeff")
+    if not text.startswith("---\n"):
+        return None, text
+    end = text.find("\n---", 4)
+    if end < 0:
+        sys.exit(f"[dsh-wiki] {label}: front-matter 未闭合（缺结束 ---）")
+    head, body = text[4:end], text[end + 4:]
+    body = body[1:] if body.startswith("\n") else body
+    meta = {}
+    for n, line in enumerate(head.split("\n"), 2):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if ":" not in line:
+            sys.exit(f"[dsh-wiki] {label}:{n}: front-matter 行需为 key: value")
+        k, v = line.split(":", 1)
+        v = v.strip()
+        try:
+            meta[k.strip()] = json.loads(v) if v else ""
+        except json.JSONDecodeError:
+            meta[k.strip()] = v
+    return meta, body
+
+
+def _assemble_files(src_dir: Path, wiki_dir: Path, warns, label: str):
+    """列出可组装的 *.md：跳过符号链接与解析后落在 wiki 目录之外的文件（防止把仓库外内容拼进 wiki）。"""
+    root = wiki_dir.resolve()
+    out = []
+    for f in sorted(src_dir.glob("*.md")):
+        if f.is_symlink():
+            warns.append(f"{label}/{f.name} 是符号链接，已跳过")
+            continue
+        try:
+            real = f.resolve()
+            real.relative_to(root)
+        except (OSError, ValueError):
+            warns.append(f"{label}/{f.name} 解析后不在 wiki 目录内，已跳过")
+            continue
+        if not real.is_file():
+            continue
+        out.append(f)
+    return out
+
+
+def _fm_text_fields(meta: dict, keys, where: str, warns) -> bool:
+    """front-matter 的 id/title 必须是字符串：数字转成字符串并告警；其它类型（列表/对象/布尔/null）告警并跳过该文件。"""
+    for k in keys:
+        if k not in meta:
+            continue
+        v = meta[k]
+        if isinstance(v, str) or (v is None and k == "parentId"):  # parentId: null = 根页面
+            continue
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            meta[k] = str(v)
+            warns.append(f"{where}: front-matter {k} 不是字符串（{v!r}），已转为 {meta[k]!r}")
+            continue
+        warns.append(f"{where}: front-matter {k} 类型非法（{type(v).__name__}），已跳过该文件")
+        return False
+    return True
+
+
+def cmd_assemble(args):
+    """pages/*.md（+ 可选 cards/*.md）→ wiki.json。保留 wiki.json 里其它顶层键；
+    cards/ 目录存在时以其为准替换 cards，否则沿用 wiki.json 现有 cards。"""
+    wiki_dir = Path(args.wiki).expanduser()
+    pages_dir = wiki_dir / "pages"
+    if not pages_dir.is_dir():
+        sys.exit(f"[dsh-wiki] assemble 失败: 缺 {pages_dir}")
+    wj = wiki_dir / "wiki.json"
+    data = _read_json(wj, "wiki.json") if wj.exists() else {}
+    if not isinstance(data, dict):
+        sys.exit(f"[dsh-wiki] {wj} 顶层必须是 JSON 对象")
+    data.setdefault("schema", "repo-wiki-local/1")
+    for key in ("repo", "title", "language"):
+        val = getattr(args, key, None)
+        if val:
+            data["repoId" if key == "repo" else key] = val
+    if not data.get("repoId"):
+        sys.exit("[dsh-wiki] assemble 失败: wiki.json 无 repoId，请用 --repo 指定仓库路径")
+    data["generatedBy"] = data.get("generatedBy") or "agent"
+    warns, pages = [], []
+    for f in _assemble_files(pages_dir, wiki_dir, warns, "pages"):
+        meta, body = _parse_front_matter(f.read_text(encoding="utf-8"), str(f))
+        if meta is None:
+            warns.append(f"{f.name} 无 front-matter，id 取文件名")
+            meta = {}
+        if not _fm_text_fields(meta, ("id", "title", "parentId", "description"), f"pages/{f.name}", warns):
+            continue
+        unknown = set(meta) - set(_FM_KEYS_PAGE)
+        if unknown:
+            warns.append(f"{f.name}: 忽略未知 front-matter 键 {', '.join(sorted(unknown))}")
+        page = {k: meta[k] for k in _FM_KEYS_PAGE if k in meta}
+        page.setdefault("id", f.stem)
+        page.setdefault("parentId", None)
+        page["markdown"] = body
+        pages.append(page)
+    if not pages:
+        sys.exit(f"[dsh-wiki] assemble 失败: {pages_dir} 下没有 *.md")
+    pages.sort(key=lambda p: (0, p["order"]) if isinstance(p.get("order"), (int, float)) else (1, 0))
+    data["pages"] = pages
+    cards_dir = wiki_dir / "cards"
+    if cards_dir.is_dir():
+        cards = []
+        for f in _assemble_files(cards_dir, wiki_dir, warns, "cards"):
+            meta, body = _parse_front_matter(f.read_text(encoding="utf-8"), str(f))
+            meta = meta or {}
+            if not _fm_text_fields(meta, ("id", "title", "kind"), f"cards/{f.name}", warns):
+                continue
+            unknown = set(meta) - set(_FM_KEYS_CARD)
+            if unknown:
+                warns.append(f"cards/{f.name}: 忽略未知 front-matter 键 {', '.join(sorted(unknown))}")
+            card = {k: meta[k] for k in _FM_KEYS_CARD if k in meta}
+            card.setdefault("id", f.stem)
+            card["summary"] = " ".join(body.split())
+            cards.append(card)
+        data["cards"] = cards
+    for w in warns:
+        print(f"[dsh-wiki] WARN {w}", file=sys.stderr)
+    _write_text(wj, json.dumps(data, ensure_ascii=False, indent=1) + "\n")
+    n_cards = len(data.get("cards") or []) if isinstance(data.get("cards"), list) else 0
+    print(f"[dsh-wiki] assemble: {len(pages)} 页, {n_cards} 张卡片 → {wj}")
 
 
 # ---------------------------------------------------------------- import legacy
@@ -1303,7 +1672,8 @@ def cmd_import(args):
 
 def cmd_build(args):
     info = build_site(Path(args.wiki).expanduser())
-    print(f"[dsh-wiki] 构建: {info['pages']} 页 → {info['path']} ({info['bytes'] // 1024} KB), "
+    cards = f" + {info['cards']} 张卡片" if info.get("cards") else ""
+    print(f"[dsh-wiki] 构建: {info['pages']} 页{cards} → {info['path']} ({info['bytes'] // 1024} KB), "
           f"mermaid离线渲染 {'✓' if info['mermaid'] else '✗(仅源码)'}")
 
 
@@ -1463,6 +1833,7 @@ def _check_refs(repo_id, pages, problems, warns, wiki_dir: Path):
         warns.append(_REF_SKIP_WARN + f": {repo_root}")
         return
     line_counts = {}
+    file_lines = {}
     n_checked = 0
     n_before = len(problems)
     for p in pages:
@@ -1480,13 +1851,19 @@ def _check_refs(repo_id, pages, problems, warns, wiki_dir: Path):
                 continue
             if rel not in line_counts:
                 try:
-                    line_counts[rel] = f.read_text(encoding="utf-8", errors="replace").count("\n") + 1
+                    text = f.read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     problems.append(f"页面 {p.get('id')}: 引用文件不可读 {rel}")
                     continue
+                line_counts[rel] = text.count("\n") + 1
+                file_lines[rel] = text.split("\n")
             if s < 1 or e < s or e > line_counts[rel]:
                 problems.append(
                     f"页面 {p.get('id')}: 行号越界 {rel}:{s}-{e}（文件共 {line_counts[rel]} 行）")
+            elif not file_lines[rel][s - 1:e] or not any(x.strip() for x in file_lines[rel][s - 1:e]):
+                # 行号在界内但指向空行：多半是写作时行号偏移，机检放行但提示复核
+                warns.append(f"页面 {p.get('id')}: 引用指向空行 {rel}:{s}" + (f"-{e}" if e != s else "")
+                             + "（行号可能偏移，请复核）")
     if n_checked:
         n_bad = len(problems) - n_before
         if n_bad:
@@ -1542,14 +1919,30 @@ def cmd_selfcheck(args):
                 problems.append(f"外链 {ref}")
             if not _mermaid_inlined(doc):
                 warns.append("站点未内联 mermaid 运行时（图表将仅显源码）")
-    _check_refs(data.get("repoId"), pages, problems, warns, wiki_dir)
+    raw_cards = data.get("cards")
+    if raw_cards is not None and not isinstance(raw_cards, list):
+        problems.append(f"cards 不是数组（{type(raw_cards).__name__}）")
+    card_warns = []
+    cards = normalize_cards(raw_cards if isinstance(raw_cards, list) else None, ids, card_warns)
+    warns.extend(card_warns)
+    if isinstance(raw_cards, list):
+        dropped = sum(1 for x in raw_cards if isinstance(x, dict)) - len(cards)
+        bad_items = sum(1 for x in raw_cards if not isinstance(x, dict))
+        if bad_items or dropped > 0:
+            problems.append(f"cards 中有 {bad_items + max(dropped, 0)} 个条目非法（见 WARN）")
+    # 卡片证据与页面引用走同一道机检：伪页面 id 为 card:<id>
+    ref_pages = list(pages) + [
+        {"id": f"card:{c['id']}", "markdown": " ".join(f"`{k}`" for k in c["keyFiles"])}
+        for c in cards]
+    _check_refs(data.get("repoId"), ref_pages, problems, warns, wiki_dir)
     for w in warns:
         print(f"[dsh-wiki] WARN {w}", file=sys.stderr)
     if problems:
         for p in problems:
             print(f"[dsh-wiki] FAIL {p}", file=sys.stderr)
         sys.exit(1)
-    print(f"[dsh-wiki] selfcheck 通过: {len(pages)} 页, 站点自包含、零外链")
+    extra = f" + {len(cards)} 张卡片" if cards else ""
+    print(f"[dsh-wiki] selfcheck 通过: {len(pages)} 页{extra}, 站点自包含、零外链")
 
 
 # ---------------------------------------------------------------- cli
@@ -1564,6 +1957,11 @@ def main():
     im.add_argument("--dest", default=None)
     sc = sub.add_parser("selfcheck", help="树完整性 + 零外链 + 引用可解析性校验")
     sc.add_argument("--wiki", required=True)
+    asm = sub.add_parser("assemble", help="由 pages/*.md（+cards/*.md）front-matter 组装 wiki.json")
+    asm.add_argument("--wiki", required=True)
+    asm.add_argument("--repo", default=None, help="写入 repoId（仓库绝对路径）")
+    asm.add_argument("--title", default=None)
+    asm.add_argument("--language", default=None)
     rc = sub.add_parser("resolve-config", help="三层合并生成配置并落 generation-meta.json")
     rc.add_argument("--repo", required=True, help="仓库路径")
     rc.add_argument("--set", action="append", default=[], metavar="K=V",
@@ -1577,6 +1975,8 @@ def main():
             cmd_import(args)
         elif args.cmd == "selfcheck":
             cmd_selfcheck(args)
+        elif args.cmd == "assemble":
+            cmd_assemble(args)
         elif args.cmd == "resolve-config":
             cmd_resolve(args)
     except RecursionError:

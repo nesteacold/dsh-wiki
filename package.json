@@ -1,6 +1,6 @@
 {
   "name": "@dsh-ext/dsh-wiki",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "纯本地 Repo Wiki（DeepWiki 式）：agent 本地读懂仓库，生成带证据引用的分页 wiki（目录树+图表），构建单文件自包含站点，零上传零网络。",
   "type": "module",
   "main": "lib/index.js",

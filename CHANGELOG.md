@@ -11,6 +11,17 @@
   `UPSTREAM.md`），这三次的安全与健壮性修复是审计本仓库代码的前提。上游 v0.2.0、v0.2.1
   两个 tag 里没有 `CHANGELOG.md`，其条目是在 v0.2.2 时补写的。
 
+## 0.2.0 — 未发布
+
+知识卡片与生成体验（spec `specs/004-wiki-knowledge-cards`，dsh-ext）。`wiki.json` schema 仍为 `repo-wiki-local/1`；无卡片的 wiki 构建输出与 0.1.x 逐字节一致（时间戳除外）。
+
+- 知识卡片：`wiki.json` 可选 `cards` 数组（`id/title/kind/summary/keyFiles/related/tags/pageIds`），构建器清洗与告警，>200 张告警；站点新增卡片网格（按类型/标签筛选）、单卡视图（关键文件、相关卡片、引用页面）、卡片进入全文搜索。
+- 页面链接 `[文本](#card-<id>)` 渲染为站内锚点；目标缺失降级为纯文本并告警。
+- selfcheck：卡片 `keyFiles` 与页面引用同一道机检；`cards` 非数组或含非法条目判 FAIL；引用指向空行时 WARN。
+- 新子命令 `assemble`：由 `pages/*.md`（+ `cards/*.md`）front-matter 组装 `wiki.json`。
+- `resolve-config` 在 generation-meta 中记录 `sourceCommit`（`git rev-parse HEAD`，非 git 仓库省略）。
+- 测试：构建器回归 66 → 92 项（原 66 项未改动）。
+
 ## 0.1.0 — 2026-11-06
 
 首个版本：纯本地 Repo Wiki 插件，适配 DSH 0.2.x；构建器与查看器移植自 zcode-repo-wiki，

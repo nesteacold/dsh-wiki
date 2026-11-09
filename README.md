@@ -91,6 +91,8 @@ desktop profile 是 `patchReload: live`，装完刷新页面即生效。版本�
 
 **从 ZCode 迁移**：对话里说「导入 ZCode 的旧 wiki」或 `/repo-wiki` 存量数据（`~/.zcode/v2/repo-wiki/<hash>`）经 `import-legacy` 一键转入——数据格式与 [zcode-repo-wiki](https://github.com/Acfufu/zcode-repo-wiki) 完全兼容。
 
+**知识卡片（0.2.0）**：除分页外，wiki 可附带短小的原子卡片（模块 / 概念 / API），证据 `path:line` 同样机检；站点里以可筛选的卡片网格、单卡视图和搜索结果呈现，页面用 `[文本](#card-<id>)` 链接。可先写带 front-matter 的 `pages/*.md` + `cards/*.md`，再用 `build_wiki_site.py assemble` 生成 `wiki.json`。
+
 ## ⚔️ 与社区同类方案对比
 
 | | dsh-wiki | dsh-openwiki | dsh-plugin-codemap | archify |
