@@ -301,8 +301,11 @@ check("generate: startSession error -> fallback", ok === false);
 
   const running = { id: "j1", root: "C:\\R", action: "generate", phase: "running", stage: "build",
     model: { provider: "r9-fallback", model: "ds41" }, startedAt: new Date().toISOString(), sessionId: "sess-abc123", pages: null };
+  // A job that exists at all implies the gate is open: the Host answers active/last = null while it is
+  // closed (lib/index.js GET /api/jobs), and the panel now renders only the notice in that branch.
+  const OPEN_GATE = { known: true, disabled: false, reason: "" };
   const runningHtml = renderToStaticMarkup(React.createElement(mod._test.JobControls,
-    { t, root: "C:\\R", generated: false, catalog, model: catalog.def, job: running, busy: true,
+    { t, root: "C:\\R", generated: false, catalog, model: catalog.def, job: running, busy: true, gate: OPEN_GATE,
       onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {} }));
   check("job controls: running job shows a progress bar, the stage label, the model and Cancel",
     /role="progressbar"/.test(runningHtml) && runningHtml.includes("Building the site")
@@ -311,8 +314,8 @@ check("generate: startSession error -> fallback", ok === false);
   check("job controls: the job's session is offered as a link + copy (panel stays open)",
     runningHtml.includes("Job session") && runningHtml.includes("Open session") && runningHtml.includes("Copy session id"));
 
-  // The Update affordance only exists while the gate is open (a closed gate renders no action button),
-  // so the finished-job fixture carries an explicitly open gate.
+  // The finished-job fixture carries an explicitly open gate: this block exercises the enabled
+  // Update path, and a closed gate now renders a disabled primary button instead of none.
   const doneHtml = renderToStaticMarkup(React.createElement(mod._test.JobControls,
     { t, root: "C:\\R", generated: true, catalog, model: catalog.def, gate: { known: true, disabled: false, reason: "" },
       job: { ...running, phase: "done", stage: "done", pages: 12, sessionId: null }, busy: false,
@@ -321,14 +324,14 @@ check("generate: startSession error -> fallback", ok === false);
     doneHtml.includes("Finished and published") && doneHtml.includes("12") && doneHtml.includes("Update wiki"));
 
   const failHtml = renderToStaticMarkup(React.createElement(mod._test.JobControls,
-    { t, root: "C:\\R", generated: true, catalog, model: catalog.def,
+    { t, root: "C:\\R", generated: true, catalog, model: catalog.def, gate: OPEN_GATE,
       job: { ...running, phase: "failed", stage: "selfcheck", sessionId: null, error: { message: "selfcheck failed: bad citation" } },
       busy: false, onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {} }));
   check("job controls: failure shows the exact error text with role=alert",
     /role="alert"/.test(failHtml) && failHtml.includes("selfcheck failed: bad citation"));
 
   const cancelHtml = renderToStaticMarkup(React.createElement(mod._test.JobControls,
-    { t, root: "C:\\R", generated: true, catalog, model: catalog.def,
+    { t, root: "C:\\R", generated: true, catalog, model: catalog.def, gate: OPEN_GATE,
       job: { ...running, phase: "canceled", sessionId: null }, busy: false, onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {} }));
   // 绝对保证已移除：取消文案只承诺“未发布候选时保持上一次已发布内容”，并说明模型权限限制。
   check("job controls: cancellation states the real guarantee (last published content kept, model not sandboxed)",
@@ -492,8 +495,10 @@ check("generate: startSession error -> fallback", ok === false);
 //
 // Host contract (lib/index.js): while the background-job gate is closed, GET /api/jobs answers
 // { ok, root, disabled: true, disabledReason, active: null, last: null } and POST returns 503.
-// The panel therefore may not offer an enabled Generate/Update, and it must treat a missing or
-// failed status as closed (fail closed) rather than falling back to "catalog ready = generate".
+// The panel therefore may not offer an enabled Generate/Update: it keeps exactly one primary button,
+// visible but disabled, with the host's reason in its title (hiding it would make the capability look
+// deleted instead of blocked). A missing or failed status counts as closed (fail closed) rather than
+// falling back to "catalog ready = generate".
 {
   const HOST_REASON = "Background wiki jobs are disabled pending filesystem isolation and recovery review";
   const t = (k) => mod._test.DICT.en[k] ?? k;
@@ -504,6 +509,20 @@ check("generate: startSession error -> fallback", ok === false);
   };
   const model = { provider: "r9-fallback", model: "ds41" };
   const primaryButtons = (html) => (html.match(/<button\b[^>]*>/g) || []).filter((b) => /class="dw-btn primary"/.test(b));
+  // 闸门关闭的契约：主按钮仍然渲染（能力可见），但禁用（不可执行），title 是宿主原文。
+  // 返回那个唯一的按钮标签，长度不等于 1 或未禁用时返回 null —— 断言因此既非空转也非"消失即通过"。
+  const closedPrimary = (html) => {
+    const b = primaryButtons(html);
+    return b.length === 1 && /disabled=""/.test(b[0]) ? b[0] : null;
+  };
+  // 闸门关闭时的动作区：按钮组就在提示条里（.dw-notice-actions 是提示条的最后一个子块），
+  // 所以从组头切到组尾正好得到“提示条里的按钮”。空字符串即“提示条里没有动作区”。
+  const noticeActions = (html) => {
+    const at = html.indexOf('class="dw-notice-actions"');
+    if (at < 0) return "";
+    const end = html.indexOf("</div></div>", at);
+    return end < 0 ? html.slice(at) : html.slice(at, end + "</div></div>".length);
+  };
   const renderJobs = (extra) => renderToStaticMarkup(React.createElement(mod._test.JobControls,
     { t, root: "C:\\R", generated: true, catalog, model, job: null, busy: false,
       onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {}, onCopyCommand() {}, ...extra }));
@@ -520,9 +539,18 @@ check("generate: startSession error -> fallback", ok === false);
     JSON.stringify([mod._test.DICT.en["job.gate.title"], mod._test.DICT.zh["job.gate.title"]]));
 
   // The reported defect: catalog ready but the host gate is closed -> the panel enabled Generate.
+  // 闸门关闭后的结构：不再有 .dw-job 卡片（宿主此时 active/last 恒为 null，卡片里只剩一个禁用按钮
+  // 的空框），被挡住的主按钮搬进提示条，和「复制命令」兜底在同一组里 —— 两者都在 .dw-notice-actions
+  // 之内，且提示条之外没有任何按钮，所以“组里恰好两个按钮”这条断言不会空转。
   const closed = renderJobs({ gate: { known: true, disabled: true, reason: HOST_REASON } });
-  check("gate: disabled + catalog ready -> Generate/Update stays disabled (no 503-capable button)",
-    primaryButtons(closed).length === 0 && closed.includes("Copy command"), closed.slice(0, 500));
+  const closedBtn = closedPrimary(closed);
+  const closedActions = noticeActions(closed);
+  check("gate: disabled + catalog ready -> exactly one disabled Generate/Update, inside the notice, no job card",
+    !!closedBtn && closedBtn.includes('title="' + HOST_REASON + '"')
+    && /class="dw-notice-actions">[\s\S]*class="dw-btn primary"[\s\S]*>Copy command<\/button>/.test(closedActions)
+    && (closedActions.match(/<button\b/g) || []).length === 2
+    && !closed.includes('class="dw-job"') && !closed.includes('id="dw-model-select"'),
+    closed.slice(0, 900));
   check("gate: the exact host disabledReason is shown verbatim and prominently",
     closed.includes('class="dw-notice"') && closed.includes(HOST_REASON)
     && /class="dw-notice-body">[\s\S]*<span>Background wiki jobs are disabled/.test(closed) && /role="status"/.test(closed));
@@ -531,8 +559,9 @@ check("generate: startSession error -> fallback", ok === false);
   check("gate: the surviving control names the exact command in its title, not in its label",
     /<button[^>]*title="Copy the \/wiki generate command — [^"]*"[^>]*>Copy command<\/button>/.test(closed),
     closed.slice(0, 700));
-  // 闸门关闭时，一个孤零零的只读模型下拉读起来像残留的杂物：卡片整体不渲染，选中的模型
-  // 作为提示条里的一行灰字保留 —— 信息没少，只是不再假装是一个可操作控件。
+  // 闸门关闭时，一个孤零零的只读模型下拉读起来像残留的杂物：卡片里不再渲染它，选中的模型
+  // 作为提示条里的一行灰字保留 —— 信息没少，只是不再假装是一个可操作控件。卡片本身留着，
+  // 里面只剩那一个禁用的主按钮（上一条已断言）。
   check("gate: the selected model stays visible as a notice line, with no stranded read-only selector",
     closed.includes("Model: r9-fallback / ds41") && !/<select/.test(closed) && !/<option/.test(closed),
     closed.slice(0, 700));
@@ -542,28 +571,39 @@ check("generate: startSession error -> fallback", ok === false);
     closed.includes("Copy command") && /class="dw-notice"[\s\S]*>Copy command<\/button>/.test(closed));
 
   // Fail closed: status missing (not yet fetched / older host) or answered without a reason.
+  // 三条都要求“一个禁用的主按钮 + 对应的原因写在 title 里”：之前 every() 在零按钮时也会真，等于放过消失。
   const missing = renderJobs({ gate: undefined });
-  check("gate: a missing gate status fails closed (Generate disabled until the Host confirms)",
-    primaryButtons(missing).every((b) => /disabled=""/.test(b)) && missing.includes("Checking whether background jobs are available"),
-    missing.slice(0, 400));
+  const missingBtn = closedPrimary(missing);
+  check("gate: a missing gate status fails closed (Generate visible but disabled until the Host confirms)",
+    !!missingBtn && missingBtn.includes('title="Checking whether background jobs are available')
+    && missing.includes("Checking whether background jobs are available"),
+    missing.slice(0, 700));
   const noReason = renderJobs({ gate: { known: true, disabled: true, reason: "" } });
+  const noReasonBtn = closedPrimary(noReason);
   check("gate: disabled without a reason says so instead of inventing one",
-    primaryButtons(noReason).every((b) => /disabled=""/.test(b)) && noReason.includes("The Host reported no reason."));
+    !!noReasonBtn && noReasonBtn.includes('title="The Host reported no reason.')
+    && noReason.includes("The Host reported no reason."));
   const badStatus = renderJobs({ gate: { known: false, disabled: true, reason: "" } });
+  const badStatusBtn = closedPrimary(badStatus);
   check("gate: an unconfirmed status (request failed) also fails closed",
-    primaryButtons(badStatus).every((b) => /disabled=""/.test(b)) && badStatus.includes("Checking whether background jobs are available"));
+    !!badStatusBtn && badStatusBtn.includes('title="Checking whether background jobs are available')
+    && badStatus.includes("Checking whether background jobs are available"));
 
   // Guard against over-disabling: only an explicit disabled:false re-enables the real action.
+  // 闸门开启时同样只有一个主按钮，只是启用 —— 恢复的是“唯一且始终可见”，不是多出一个控件。
+  // 卡片也照旧：.dw-job 里是模型下拉 + 启用的主按钮，提示条在这个分支不该出现。
   const open = renderJobs({ gate: { known: true, disabled: false, reason: "" } });
   // 闸门开启时模型卡片照旧：下拉重新出现，模型选择没有变成永久只读的说明文字
   check("gate: an explicit disabled:false restores the normal Generate/Update button and the model card",
-    primaryButtons(open).length >= 1 && !primaryButtons(open).every((b) => /disabled=""/.test(b))
+    primaryButtons(open).length === 1 && !/disabled=""/.test(primaryButtons(open)[0])
     && !open.includes('class="dw-gate"') && open.includes("keeps running in the background")
+    && open.includes('class="dw-job"') && !open.includes('class="dw-notice"')
     && /<select id="dw-model-select"/.test(open), open.slice(0, 400));
   const noCatalog = renderJobs({ gate: { known: true, disabled: false, reason: "" }, model: null,
     catalog: { phase: "error", models: [], failures: [], def: null, error: "no service" } });
   check("gate: a broken model catalog still blocks generation independently of the gate",
-    primaryButtons(noCatalog).every((b) => /disabled=""/.test(b)) && noCatalog.includes("Model catalog unavailable"));
+    primaryButtons(noCatalog).length === 1 && /disabled=""/.test(primaryButtons(noCatalog)[0])
+    && noCatalog.includes("Model catalog unavailable"));
 
   // ---- Detail render: the gate reaches the overview (catalog ready, host gate closed) ----
   const hk = { at: 0, states: [], effects: [] };
@@ -621,9 +661,14 @@ check("generate: startSession error -> fallback", ok === false);
 
   const closedOverview = renderOverview({ known: true, disabled: true, reason: HOST_REASON });
   const closedMenu = renderOverview({ known: true, disabled: true, reason: HOST_REASON }, true);
-  check("gate render: overview shows the exact host reason and no enabled Generate/Update",
+  const closedOverviewBtn = closedPrimary(closedOverview);
+  check("gate render: overview shows the exact host reason and a disabled (not hidden) Generate/Update",
     closedOverview.includes(HOST_REASON) && closedOverview.includes('class="dw-notice"')
-    && primaryButtons(closedOverview).length === 0, closedOverview.slice(0, 700));
+    && !!closedOverviewBtn && closedOverviewBtn.includes('title="' + HOST_REASON + '"')
+    && closedOverview.includes("↻ Update wiki")
+    // 同一个提示条里：被挡住的主按钮 + 「复制命令」兜底；概览里没有任何空的 .dw-job 卡片
+    && /class="dw-notice-actions">[\s\S]*class="dw-btn primary"[\s\S]*>Copy command<\/button>/.test(noticeActions(closedOverview))
+    && !closedOverview.includes('class="dw-job"'), closedOverview.slice(0, 900));
   check("gate render: the update-available banner action is disabled too (no false update capability)",
     !closedOverview.includes('class="dw-banner"') && !/class="dw-btn[^"]*"[^>]*>Update wiki</.test(closedOverview)
     && /class="dw-hero-sub">[^<]*new commits[^<]*\(HEAD feedfac\)/.test(closedOverview), closedOverview.slice(0, 900));

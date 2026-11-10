@@ -115,9 +115,25 @@ a path. Server contract today:
 | `/dsh-wiki/api/jobs/recovery-execute` | POST | **403/503 while disabled; requires `confirm`** | The only route that may execute a recovery plan. Requires the literal body field `confirm: "execute-recovery"`, same-origin, JSON, the authorised root and an open journal store. **It cannot currently complete a post-restart restore** — see the limitation below. |
 
 So the model catalog is available, but there is **no live generation** from the panel in this release.
-The existing model-selector UI must be treated as disabled/inert: a selection only changes the
-dropdown value, Generate/Update cannot start a job (503), and no job can ever become active. Use the
-in-session, foreground `/wiki generate` instead.
+The Generate/Update control stays **visible but disabled**, with the Host's exact gate reason shown as
+text in the notice beside it: a capability that vanished would be indistinguishable from a capability
+that was removed, and the user could not tell "not now" from "never again". The reason is deliberately
+**visible text rather than a hover tooltip**, because a disabled form control's tooltip is not reliable
+across browsers (not measured on this machine — treated as a reason to use visible text, not as a fact
+about any particular engine). The model dropdown is **not** rendered while the gate is closed (the
+selected model is shown as one muted line in the notice instead), because a lone read-only selector
+reads as left-over debris. A selection could not start anything anyway: Generate/Update is disabled, the
+POST route answers 503, and no job can ever become active. Use the in-session, foreground
+`/wiki generate` instead — the panel offers a "Copy command" button for exactly that.
+
+There is **no separate "Regenerate" action**, and this is a server fact rather than a UI omission:
+`lib/jobs.js` defines `JOB_ACTIONS = ["generate", "update", "translate"]`, and `buildWorkerPrompt`
+(`lib/worker-protocol.js`) takes only `{jobId, root, stageDir, config}` — it rejects unknown keys and
+never sees `action`. So "Generate" and "Update" build an **identical** worker task and differ only in
+the button label (which depends on whether a wiki already exists). In particular "Update wiki" is not an
+incremental update: `lib/jobs.js` reports `incremental-unsupported` ("incremental wiki generation is not
+supported in this slice"). A distinct Regenerate control would advertise a distinction that does not
+exist; if incremental update is ever implemented, it needs a server-side action first.
 
 Why the gate: a background job would run an ordinary model session with **no filesystem isolation**
 ("do not touch the live `.dsh-wiki`" is a prompt-level rule, not a sandbox), and the former read routes

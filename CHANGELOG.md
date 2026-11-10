@@ -17,12 +17,16 @@
 
 - `GET /dsh-wiki/api/models`：唯一仍可用的接口（只读），来自 `sessionController.modelCatalog()`；服务缺失 503。它只列出模型，不生成任何东西——本版本**没有活的生成能力**。
 - `POST /dsh-wiki/api/jobs` 与 `POST /dsh-wiki/api/jobs/cancel`：一律 **503** `{ error: <闸门消息>, disabled: true }`，在读取请求体、解析 Host 服务、触碰任何路径之前返回（`translate` 同样是 503，不再是 501）。
-- `GET /dsh-wiki/api/jobs?root=`：200 disabled 负载 `{ ok, root, disabled: true, disabledReason, active: null, last: null }`；宿主**不构造**作业管理器。未知 root 仍 403（白名单仍在）。
+- `GET /dsh-wiki/api/jobs?root=`：200 disabled 负载 `{ ok, root, disabled: true, disabledReason, active: null, last: null }`；宿主**仍然构造**作业管理器并持有可信 journal store（`lib/index.js` 构造、闸门只挡路由），只是闸门让它始终空闲。未知 root 仍 403（白名单仍在）。
 - 只读路由不再调用 `recover()`：`GET /api/projects|project|wiki|site` 不会把崩溃遗留的 `.dsh-wiki.bak-*` 改名，查看 wiki 是纯读操作（旧实现会在普通读取时重命名任意备份目录，等于读接口触发写）。
 
 为什么关：后台作业启动的是普通模型会话，**没有文件系统隔离**（提示词级的「别碰 live `.dsh-wiki`」不是沙箱）；而只读 GET 里的 `recover()` 会在查看时改动文件系统。隔离 + 可信恢复落地前不开闸；开闸的正确方式是先完成这两项，再把 `lib/jobs.js` 的作业管理器接回 `lib/index.js`（现场注释已写明，不要只改常量）。
 
 本切片另落地两处能力与一处措辞修正：
+
+- 面板总览重做：hero 标题区（标题、中间省略的仓库路径、状态 pill）取代原来的 h1 + 路径 + 横幅 + 动作行；竞争的第二枚「Update wiki」按钮与重复的「in Chat」按钮已删除，只剩**一枚**主操作；闸门关闭时该主操作**仍然可见但 disabled**，Host 的原始原因以文字形式显示在同一提示块里（Chromium 不会给 disabled 控件弹 `title` 提示，所以原因必须是可见文字）；关闭时不再渲染模型下拉，选中的模型改为提示块里一行 muted 文本；闸门块从 1px 黑色重边框 + ⛔ emoji 改为左侧警示色条的紧凑提示；六个统计格改为带 1px 分隔线的条带，数值 `nowrap` + 等宽数字，时间不再折成三行；disabled 按钮不再显得可点。
+- **没有独立的「Regenerate」动作**，这是服务端事实而非 UI 遗漏：`lib/jobs.js` 的 `JOB_ACTIONS = ["generate","update","translate"]`，且 `buildWorkerPrompt`（`lib/worker-protocol.js`）只接受 `{jobId, root, stageDir, config}`、拒绝未知键、根本看不到 `action`——所以 Generate 与 Update 生成的是**同一个** worker 任务，只有按钮标签随「是否已存在 wiki」变化；「Update wiki」也不是增量更新（`lib/jobs.js` 报 `incremental-unsupported`）。多一枚 Regenerate 按钮只会宣传一个不存在的区别。
+- `tools/ui-preview.mjs`：把真实组件渲染成 7 个状态（light / dark / 闸门开启且作业在跑（含菜单）/ 未生成 / 460px 与 464px 窄面板 / 未生成且闸门关闭）的**自包含** HTML，布局改动可以直接截图评审，而不是靠嘴说。
 
 - 站点 chrome 支持越南语：`wiki.json` 的 `language` 为 `vi*` 时全站 chrome 用越南语，`zh*` 用中文，其余（默认）英文；页面**正文**语言另行由 resolve-config 的 `language` 字段决定，本切片保持 canonical `en`。
 - 新子命令 `diff-impact`（只读）：把 `<from>..<to>` 的改动文件映射到受影响页面/卡片，输出 `from`、`to`、`changedFiles`、`affectedPages`、`affectedCards`、`unmappedFiles`；按精确路径或目录前缀匹配 `filePaths`/`keyFiles`，不构建、不写盘、不联网，失败退出 2。

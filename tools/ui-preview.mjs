@@ -1,5 +1,5 @@
 // dsh-wiki 面板 UI 预览：把 lib/client.js 的真实 Detail 概览渲染成一个自包含的 HTML 文件，
-// 供人截图看排版（六种状态：四种常规宽度 + 两个停靠窄面板，后者正是闸门提示条最容易塌的地方）。
+// 供人截图看排版（七种状态：五种常规宽度 + 两个停靠窄面板，后者正是闸门提示条最容易塌的地方）。
 // 用法：
 //   node tools/ui-preview.mjs [输出路径]
 // 默认写到 %TEMP%\dsh-wiki-ui-preview.html。不联网、不开服务、不启动浏览器：写一个文件就退出 0。
@@ -177,6 +177,17 @@ const PANELS = [
     data: { phase: "ready", info: infoGenerated, wiki: WIKI, missing: false, error: null },
     jobView: { active: null, last: null, gate: CLOSED_GATE },
   },
+  // 闸门关闭 + 从未生成：桩件里唯一会显示「Generate wiki」的停用主按钮（主按钮文案按项目状态取，
+  // 闸门关闭时同样可见，只是禁用）—— 这正是「生成入口去哪了」会指向的那一格。
+  // 闸门关闭的每一格（a, b, e, f, g）都应该长成同一个形状：一条 .dw-notice，里面有被挡住的主按钮
+  // 和「Copy command」兜底，并且没有任何 .dw-job 卡片（只有闸门开启的 c/d 才有卡片）。
+  {
+    caption: "g · light · gate closed · project not generated yet",
+    dark: false,
+    project: { root: ROOT, title: "dsh-ext", generated: false, workspaceId: null },
+    data: { phase: "ready", info: infoMissing, wiki: null, missing: false, error: null },
+    jobView: { active: null, last: null, gate: CLOSED_GATE },
+  },
 ];
 
 // ---------- 渲染 ----------
@@ -278,7 +289,7 @@ function main() {
     "<style>" + PREVIEW_CSS + "\n" + mod._test.CSS + "</style>",
     "</head><body>",
     '<h1 class="pv-title">dsh-wiki · overview panel</h1>',
-    '<p class="pv-note">Rendered from lib/client.js with canned state · zero external requests · ' + PANELS.length + " states · a–d at panel width, e/f forced to 460px/464px</p>",
+    '<p class="pv-note">Rendered from lib/client.js with canned state · zero external requests · ' + PANELS.length + " states · a–d and g at panel width, e/f forced to 460px/464px</p>",
     '<main class="pv-page">',
     body,
     "</main>",
