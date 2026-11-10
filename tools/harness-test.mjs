@@ -1763,10 +1763,24 @@ const guardUnloadCase = async ({ name, unresolved, disposeError = null }) => {
     mkdirSync(repoRoot, { recursive: true });
     const state = makeCtx(name);
     const starts = [];
+    let storeOpens = 0;
+    // 增量前置解析的替身（spec 013）：harness 只验证**路由的 §2.1 真值表**与“拒绝不启动作业”。
+    // 真正的基线/祖先/diff-impact 解析在 jobs-harness-test 里用真 jobs.js 覆盖。
+    const plan = {
+      mode: "incremental",
+      baseline: "a".repeat(40),
+      head: "b".repeat(40),
+      pages: [{ id: "overview", filePaths: ["README.md"] }],
+      cards: [],
+      unmappedFiles: ["docs/notes.md"],
+      changedFiles: 2,
+    };
+    const planner = { next: () => plan };
     spyJobsInternals({
-      openJournalStore: async () => ({ load: async () => null, create: async () => ({}), advance: async () => ({}), replaceTerminal: async () => ({}) }),
+      openJournalStore: async () => { storeOpens += 1; return { load: async () => null, create: async () => ({}), advance: async () => ({}), replaceTerminal: async () => ({}) }; },
       createJobManager: () => ({
         start: (request) => { starts.push(request); return { id: "job1" }; },
+        incrementalPlan: async () => planner.next(),
         cancel: () => ({ canceled: false }), view: () => ({ active: null, last: null }),
         journalState: () => ({ mode: "journal", missing: [] }), dispose: async () => ({ unresolved: [] }),
       }),
@@ -1778,20 +1792,63 @@ const guardUnloadCase = async ({ name, unresolved, disposeError = null }) => {
     apply(state.ctx, { wikiDirName: ".dsh-wiki", wikiRoots: [repoRoot], jobs: { enabled: true, storeDir: path.join(dir, "journal") } });
     await waitFor(() => state.registered.routes.length === 1, `${name} runtime`);
     fixtures.push(state);
-    return { state, client: makeClient(state.registered.routes[0].handler), repoRoot, starts };
+    return { state, client: makeClient(state.registered.routes[0].handler), repoRoot, starts, planner, opens: () => storeOpens, storeDir: path.join(dir, "journal") };
   };
   const req = await makeJobs("incremental");
   const body = { root: req.repoRoot, action: "generate", model: { provider: "p", model: "m" } };
-  let r2 = await req.client.post("/dsh-wiki/api/jobs", { ...body, incremental: true });
-  check("fix2: incremental:true is refused explicitly (501) instead of being silently coerced",
-    r2.status === 501 && r2.json?.code === "incremental-unsupported" && req.starts.length === 0,
-    `${r2.status} ${r2.body.slice(0, 200)}`);
-  r2 = await req.client.post("/dsh-wiki/api/jobs", { ...body, incremental: { mode: "diff" } });
-  check("fix2: an incremental mode object is refused (400 invalid type), never coerced to a full generate",
-    r2.status === 400 && r2.json?.code === "invalid-incremental" && req.starts.length === 0);
-  r2 = await req.client.post("/dsh-wiki/api/jobs", { ...body, incremental: true });
-  check("fix2: the refusal is truthful and mentions the slice",
-    r2.status === 501 && /incremental/i.test(r2.json?.error ?? "") && /not supported in this slice/i.test(r2.json?.error ?? ""));
+  const updateBody = { ...body, action: "update" };
+  const refusedWithoutJob = async (label, patch, status, code) => {
+    const before = req.starts.length;
+    const r = await req.client.post("/dsh-wiki/api/jobs", { ...body, ...patch });
+    check(`spec013: ${label} is refused (${status} ${code}) and starts no job`,
+      r.status === status && r.json?.code === code && req.starts.length === before,
+      `${r.status} ${r.body.slice(0, 200)}`);
+    return r;
+  };
+  // §2.1 真值表：incremental 只和 action:"update" 一起被接受。
+  await refusedWithoutJob("incremental:true on generate", { incremental: true }, 400, "incremental-not-for-generate");
+  await refusedWithoutJob("incremental:true on translate", { action: "translate", targetLang: "vi", incremental: true }, 400, "incremental-not-for-translate");
+  await refusedWithoutJob("incremental as an object", { action: "update", incremental: { mode: "diff" } }, 400, "invalid-incremental");
+  await refusedWithoutJob("incremental as a string", { action: "update", incremental: "true" }, 400, "invalid-incremental");
+  await refusedWithoutJob("incremental as null", { action: "update", incremental: null }, 400, "invalid-incremental");
+  // 拒绝必须是显式 409（不是 202 + 失败作业，也不是静默全量重建），并且不打开 journal store、不建目录。
+  req.planner.next = () => { throw Object.assign(new Error("no live wiki"), { status: 409, code: "incremental-no-baseline" }); };
+  const noBaseline = await refusedWithoutJob("incremental with no published baseline", { action: "update", incremental: true }, 409, "incremental-no-baseline");
+  check("spec013: the no-baseline refusal names what is missing and suggests a full update",
+    /sourceCommit/i.test(noBaseline.json?.error ?? "") && /full update/i.test(noBaseline.json?.error ?? ""),
+    String(noBaseline.json?.error));
+  // 拒绝必须是**显式**的：没有作业、没有 202、响应体里没有仓库路径（路径与原始文本只进 logger）。
+  check("spec013: the five refusals above started no job, returned no 202 and carried no repository path",
+    req.starts.length === 0 && !noBaseline.body.includes(req.repoRoot) && noBaseline.status === 409,
+    `${req.starts.length} ${noBaseline.body.slice(0, 200)}`);
+  // HEAD == 基线（review minor）：没有新提交就没有事可做 => 显式 409，绝不是一个“已接纳、随后无事发生”的作业。
+  req.planner.next = () => { throw Object.assign(new Error("up to date"), { status: 409, code: "incremental-up-to-date" }); };
+  const upToDate = await refusedWithoutJob("incremental whose published wiki already matches HEAD", { action: "update", incremental: true }, 409, "incremental-up-to-date");
+  check("spec013: the up-to-date refusal keeps its fixed sentence (already matches HEAD, suggests a full update) and no path",
+    upToDate.json?.error === PUBLIC_ERROR_MESSAGES["incremental-up-to-date"]
+    && /matches HEAD/i.test(upToDate.json?.error ?? "") && /full update/i.test(upToDate.json?.error ?? "")
+    && !upToDate.body.includes(req.repoRoot), upToDate.body.slice(0, 240));
+  const BUILDER_LINE = "diff-impact failed: git is not installed or not on PATH";
+  req.planner.next = () => {
+    throw Object.assign(new Error(BUILDER_LINE), { status: 409, code: "incremental-unavailable", builderLine: BUILDER_LINE });
+  };
+  const unavailable = await refusedWithoutJob("incremental whose diff-impact fails", { action: "update", incremental: true }, 409, "incremental-unavailable");
+  check("spec013: the diff-impact refusal carries the builder's first line as a bounded detail",
+    unavailable.json?.detail === BUILDER_LINE && typeof unavailable.json?.error === "string"
+    && unavailable.json.error !== BUILDER_LINE, unavailable.body.slice(0, 240));
+  req.planner.next = () => { throw Object.assign(new Error("not an ancestor"), { status: 409, code: "incremental-baseline-diverged" }); };
+  await refusedWithoutJob("incremental whose baseline is not an ancestor of HEAD", { action: "update", incremental: true }, 409, "incremental-baseline-diverged");
+  // 接受路径：incremental:true + update => 202，且 plan 原样交给 manager.start。
+  req.planner.next = () => ({
+    mode: "incremental", baseline: "c".repeat(40), head: "d".repeat(40),
+    pages: [{ id: "overview", filePaths: ["README.md"] }], cards: [], unmappedFiles: [], changedFiles: 1,
+  });
+  let r2 = await req.client.post("/dsh-wiki/api/jobs", { ...updateBody, incremental: true });
+  check("spec013: incremental:true + update is accepted (202) and hands the resolved plan to the manager",
+    r2.status === 202 && req.starts.length === 1 && req.starts[0].action === "update"
+    && req.starts[0].incremental?.mode === "incremental"
+    && req.starts[0].incremental?.baseline === "c".repeat(40)
+    && req.starts[0].incremental?.pages?.[0]?.id === "overview", `${r2.status} ${r2.body.slice(0, 240)}`);
   r2 = await req.client.post("/dsh-wiki/api/jobs", { ...body, mode: "incremental" });
   check("fix2: an unknown top-level field is rejected (400) instead of dropped",
     r2.status === 400 && r2.json?.code === "unsupported-field"
@@ -1805,7 +1862,9 @@ const guardUnloadCase = async ({ name, unresolved, disposeError = null }) => {
     r2.status === 400 && r2.json?.code === "unsupported-field");
   r2 = await req.client.post("/dsh-wiki/api/jobs", { ...body, incremental: false });
   check("fix2: explicit incremental:false keeps the supported full-generate path (no silent downgrade claim)",
-    r2.status === 202 && req.starts.length === 1 && r2.json?.job?.id === "job1", `${r2.status} ${r2.body.slice(0, 160)}`);
+    r2.status === 202 && req.starts.length === 2 && r2.json?.job?.id === "job1", `${r2.status} ${r2.body.slice(0, 160)}`);
+  check("fix2: the full-generate request reaches the manager without any incremental plan",
+    req.starts[1] !== undefined && req.starts[1].incremental === undefined, JSON.stringify(req.starts[1] ?? null));
 
   // 22b. Origin scheme 必须与请求实际使用的传输一致：https 的 Origin 不能被 http 监听当成同源。
   r2 = await req.client.post("/dsh-wiki/api/jobs", body, { origin: "https://127.0.0.1:19388" });
@@ -2074,7 +2133,9 @@ const collectStrings = (value, out = []) => {  if (typeof value === "string") ou
     ["model extra field", { model: { provider: "p", model: "m", temperature: 1 } }, 400, "unsupported-field"],
     ["incremental string", { incremental: "false" }, 400, "invalid-incremental"],
     ["incremental null", { incremental: null }, 400, "invalid-incremental"],
-    ["incremental true", { incremental: true }, 501, "incremental-unsupported"],
+    // spec 013 §2.1：增量只和 action="update" 一起可用；generate/translate 上的 incremental 是显式拒绝。
+    ["incremental true on generate", { incremental: true }, 400, "incremental-not-for-generate"],
+    ["incremental true on translate", { action: "translate", targetLang: "vi", incremental: true }, 400, "incremental-not-for-translate"],
     ["unknown field", { mode: "incremental" }, 400, "unsupported-field"],
   ]) await rejectCase(label, patch, status, code);
   const rc = await client.post("/dsh-wiki/api/jobs/cancel", { root: 42 });

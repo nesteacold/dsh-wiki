@@ -5,6 +5,7 @@
 // 假宿主在 agents.create 里跑真正的 setup；builder 用真实 python 脚本。candidate 由 Host 的 assemble 组装
 // （worker 只写 pages/cards），所以 wiki.json 的 repoId/language 由 Host 决定，worker 无法伪造。
 // worker 专项（setup 顺序/失败/隔离/泄漏绊线）见 tools/jobs-worker-test.mjs。
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -14,6 +15,10 @@ const here = import.meta.dirname;
 const jobsUrl = pathToFileURL(path.join(here, "..", "lib", "jobs.js")).href;
 const { createJobManager, evaluateContentGate, PUBLIC_ERROR_MESSAGES, readBoundedJson } = await import(jobsUrl);
 const { buildWorkerPrompt, buildTranslationPrompt } = await import(pathToFileURL(path.join(here, "..", "lib", "worker-protocol.js")).href);
+// 增量上限与 commit 形状只有一份定义（叶子模块）：jobs.js 与 worker-protocol.js 各自 import 它，
+// 所以两份“不能漂移”的比对检查是空转的，已删除；改为断言“只有这一份定义”。
+const INCREMENTAL_LIMITS_URL = pathToFileURL(path.join(here, "..", "lib", "incremental-limits.js")).href;
+const { INCREMENTAL_LIMITS } = await import(INCREMENTAL_LIMITS_URL);
 const { openJournalStore } = await import(pathToFileURL(path.join(here, "..", "lib", "journal-store.js")).href);
 
 // Every fixture directory is registered on creation and removed from one place, so a failed check or an
@@ -1412,6 +1417,759 @@ check("after dispose, new jobs are refused (503 plugin-unloaded)",
       && received.body.includes("request body exceeds 64 bytes"),
       JSON.stringify({ enteredReadLoop, handlerOutcome, status: received.status, body: received.body.slice(0, 200) }));
   }
+}
+
+// ---------- 15. 增量更新（spec 013）：基线 / 祖先 / 影响映射 / 播种 / 改写计数 / sourceCommit ----------
+// 这一节用**桩 builder**（cfg.runBuilder）与注入的 git 事实（cfg.getSourceCommit / cfg.isAncestor）：
+// 即使没有 git、没有 python，作业编排的每一步也必须可断言。真 diff-impact 的只读行为由
+// tests/test_build_wiki_site.py 覆盖，不在这里重复。
+{
+  const EFFECTIVE = {
+    language: "en", granularity: "hybrid", pages: { min: 6, max: 16 }, tree: { maxChildren: 6, maxDepth: 4 },
+    wordsPerPage: [100, 3000], diagrams: "minimal", citations: "strict", skeleton: { knownIssues: true },
+  };
+  const BASELINE = "1".repeat(40);
+  const HEAD = "2".repeat(40);
+  const sha = (char) => char.repeat(40);
+  const incrRoots = [
+    tempDir("dsh-wiki-incr-base-"), tempDir("dsh-wiki-incr-flat-"),
+    tempDir("dsh-wiki-incr-diverged-"), tempDir("dsh-wiki-incr-diff-"), tempDir("dsh-wiki-incr-seed-"),
+    tempDir("dsh-wiki-incr-rewrite-"), tempDir("dsh-wiki-incr-zero-"),
+    // 15h 授权范围复核：改写 / 删除未受影响的页、什么都不动、只动受影响集合、非法字节改写。
+    tempDir("dsh-wiki-incr-scope-rewrite-"), tempDir("dsh-wiki-incr-scope-delete-"),
+    tempDir("dsh-wiki-incr-scope-clean-"), tempDir("dsh-wiki-incr-scope-affected-"),
+    tempDir("dsh-wiki-incr-scope-bytes-"),
+    // 15i 整树复核（review MAJOR）：wiki.json 的非 pages/cards 顶层键、新增顶层文件、新增空目录、
+    // assemble 自己重写 pages/cards（不许误报）。
+    tempDir("dsh-wiki-incr-scope-wikikey-"), tempDir("dsh-wiki-incr-scope-extrafile-"),
+    tempDir("dsh-wiki-incr-scope-emptydir-"), tempDir("dsh-wiki-incr-scope-assemble-"),
+    // 15j id/文件名一一对应（review minor）：front-matter 的 id 与文件名不一致、受影响 id 没有文件、
+    // 以及“导入的 wiki 没有 front-matter”（合法，绝不许拒绝）。
+    tempDir("dsh-wiki-incr-idmismatch-"), tempDir("dsh-wiki-incr-idmissing-"),
+    tempDir("dsh-wiki-incr-nofrontmatter-"),
+    // 15k/15l worker 停下之后的 id 复核与删除记录（review MAJOR，D1/D2）：受影响页被改写成别页的 id、
+    // 改写成自己的 id、去掉整个 front-matter、被删除，以及受影响卡片被删除。
+    tempDir("dsh-wiki-incr-idretarget-"), tempDir("dsh-wiki-incr-idself-"),
+    tempDir("dsh-wiki-incr-idsnofm-"), tempDir("dsh-wiki-incr-pagedelete-"),
+    tempDir("dsh-wiki-incr-carddelete-"),
+  ].map((value) => realpathSync(value));
+  const [
+    incrBase, incrFlat, incrDiverged, incrDiffFails, incrSeedFails, incrRewrite, incrZero,
+    incrScopeRewrite, incrScopeDelete, incrScopeClean, incrScopeAffected, incrScopeBytes,
+    incrScopeWikiKey, incrScopeExtraFile, incrScopeEmptyDir, incrScopeAssemble,
+    incrIdMismatch, incrIdMissing, incrNoFrontMatter,
+    incrIdRetarget, incrIdSelf, incrIdNoBlock, incrPageDelete, incrCardDelete,
+  ] = incrRoots;
+  const INCR_PAGE_A = "# Overview\n\nSee `README.md:1`.\n";
+  const INCR_PAGE_B = "# Build\n\nSee `build.sh:1`.\n";
+  const incrWiki = (root, overrides = {}) => ({
+    schema: "repo-wiki-local/1", repoId: root, title: "Live", language: "en",
+    pages: [
+      { id: "overview", parentId: null, order: 1, title: "Overview", description: "d", filePaths: ["README.md"], markdown: INCR_PAGE_A },
+      { id: "build", parentId: null, order: 2, title: "Build", description: "d", filePaths: ["build.sh"], markdown: INCR_PAGE_B },
+    ],
+    cards: [],
+    ...overrides,
+  });
+  // live wiki 的落地形状：wiki.json + pages/*.md + generation-meta.json（sourceCommit 的唯一真实来源）。
+  const writeIncrLive = (root, { sourceCommit = BASELINE, wiki = null, meta = true, wikiJsonSourceCommit = null } = {}) => {
+    const live = path.join(root, ".dsh-wiki");
+    mkdirSync(path.join(live, "pages"), { recursive: true });
+    const data = wiki ?? incrWiki(root);
+    writeFileSync(path.join(live, "wiki.json"), JSON.stringify(wikiJsonSourceCommit === null ? data : { ...data, sourceCommit: wikiJsonSourceCommit }));
+    writeFileSync(path.join(live, "pages", "overview.md"), `---\nid: "overview"\nparentId: null\norder: 1\ntitle: "Overview"\ndescription: "d"\nfilePaths: ["README.md"]\n---\n${INCR_PAGE_A}`);
+    writeFileSync(path.join(live, "pages", "build.md"), `---\nid: "build"\nparentId: null\norder: 2\ntitle: "Build"\ndescription: "d"\nfilePaths: ["build.sh"]\n---\n${INCR_PAGE_B}`);
+    if (meta) {
+      writeFileSync(path.join(live, "generation-meta.json"), JSON.stringify({
+        schema: "repo-wiki-local/1", kind: "generation-meta", repoId: root, sourceCommit,
+      }));
+    } else {
+      rmSync(path.join(live, "generation-meta.json"), { force: true });
+    }
+    return live;
+  };
+  for (const root of incrRoots) writeIncrLive(root);
+  // 没有 generation-meta.json、只有 wiki.json 的 sourceCommit：基线仍必须解析出来（导入的 wiki）。
+  writeIncrLive(incrFlat, { meta: false, wikiJsonSourceCommit: BASELINE });
+  // 15j 的两个“id 与文件名不一致”的已发布形状：受影响 id 是 overview（diff-impact 桩固定这样说）。
+  //   (a) pages/overview.md 存在，但它的 front-matter 声明 id: "build" —— 合法重写会落到别页上；
+  //   (b) wiki.json 里仍有 overview 页，但 pages/overview.md 不存在 —— 受影响集合指向一个不存在的文件。
+  writeFileSync(path.join(incrIdMismatch, ".dsh-wiki", "pages", "overview.md"),
+    `---\nid: "build"\nparentId: null\norder: 2\ntitle: "Overview"\ndescription: "d"\nfilePaths: ["README.md"]\n---\n${INCR_PAGE_A}`);
+  rmSync(path.join(incrIdMissing, ".dsh-wiki", "pages", "overview.md"), { force: true });
+  // 导入的 wiki（import-legacy）写的 pages/*.md **没有** front-matter：id 由文件名决定，这是合法的，
+  // 增量计划绝不许因为“读不到 id”而拒绝它。
+  writeFileSync(path.join(incrNoFrontMatter, ".dsh-wiki", "pages", "overview.md"), INCR_PAGE_A);
+  writeFileSync(path.join(incrNoFrontMatter, ".dsh-wiki", "pages", "build.md"), INCR_PAGE_B);
+  // 15k 的反面：live 的受影响页同样没有 front-matter，而 worker 给它写一个 id **等于自己文件名** 的
+  // front-matter——那是合法重写，绝不许误判成“重定向到别页”。
+  writeFileSync(path.join(incrIdSelf, ".dsh-wiki", "pages", "overview.md"), INCR_PAGE_A);
+  // 15l：受影响集合里有卡片时，live 必须真的有一张 cards/glossary.md（受影响 id 与文件一一对应）。
+  writeFileSync(path.join(incrCardDelete, ".dsh-wiki", "wiki.json"), JSON.stringify(incrWiki(incrCardDelete, {
+    cards: [{ id: "glossary", title: "Glossary", kind: "concept", summary: "one line" }],
+  })));
+  mkdirSync(path.join(incrCardDelete, ".dsh-wiki", "cards"), { recursive: true });
+  writeFileSync(path.join(incrCardDelete, ".dsh-wiki", "cards", "glossary.md"),
+    `---\nid: "glossary"\ntitle: "Glossary"\nkind: "concept"\n---\nOne line.\n`);
+
+  const INCR_HOST = "host-jobs-harness-incr";
+  const INCR_STORE = realpathSync(tempDir("dsh-wiki-journal-incr-"));
+  const incrStore = await openJournalStore({ storeDir: INCR_STORE, allowedRoots: incrRoots, hostInstanceId: INCR_HOST });
+  // 桩 builder：diff-impact 由每个用例自己决定形状（这就是被测输入），其余子命令给出可发布的最小候选。
+  const incrBuilder = (overrides = {}) => async (job, args) => {
+    const name = args[0];
+    if (overrides[name]) return overrides[name](job, args);
+    if (name === "resolve-config") return { ok: true, code: 0, output: "", stdout: JSON.stringify(EFFECTIVE) };
+    if (name === "diff-impact") {
+      return {
+        ok: true, code: 0, output: "", stdout: JSON.stringify({
+          from: BASELINE, to: HEAD, changedFiles: ["README.md", "build.sh"],
+          affectedPages: [{ id: "overview", title: "Overview", matchedFiles: ["README.md"] }],
+          affectedCards: [],
+          unmappedFiles: ["docs/notes.md"],
+        }),
+      };
+    }
+    if (name === "assemble") {
+      const wiki = JSON.parse(readFileSync(path.join(job.stageDir, "wiki.json"), "utf8"));
+      wiki.repoId = job.root;
+      wiki.language = "en";
+      writeFileSync(path.join(job.stageDir, "wiki.json"), JSON.stringify(wiki));
+      return { ok: true, code: 0, output: "", stdout: "" };
+    }
+    return { ok: true, code: 0, output: "", stdout: "" };
+  };
+  const incrManager = (overrides = {}) => createJobManager(configOf({
+    journalStore: incrStore, hostInstanceId: INCR_HOST, allowedRoots: incrRoots,
+    runBuilder: incrBuilder(), getSourceCommit: async () => HEAD, isAncestor: async () => true,
+    jobTimeoutMs: 60000, ...overrides,
+  }));
+
+  // 15a. 基线解析：generation-meta.json 优先；wiki.json 的 sourceCommit 是备选；都没有 => 409。
+  {
+    const m = incrManager();
+    const plan = await m.incrementalPlan(incrBase);
+    check("incremental baseline: generation-meta.json sourceCommit is the baseline",
+      plan.baseline === BASELINE && plan.head === HEAD && plan.baselineSource === "generation-meta.json",
+      JSON.stringify(plan));
+    const flat = await m.incrementalPlan(incrFlat);
+    check("incremental baseline: a wiki without generation-meta.json falls back to wiki.json sourceCommit",
+      flat.baseline === BASELINE && flat.baselineSource === "wiki.json", JSON.stringify(flat));
+    check("incremental baseline: the plan carries the affected set as { id, filePaths }",
+      JSON.stringify(plan.pages) === JSON.stringify([{ id: "overview", filePaths: ["README.md"] }])
+      && plan.cards.length === 0 && JSON.stringify(plan.unmappedFiles) === JSON.stringify(["docs/notes.md"]),
+      JSON.stringify(plan.pages));
+    // 没有可用 sourceCommit 的 live wiki：显式 409 incremental-no-baseline（绝不静默全量重建）。
+    const noMeta = realpathSync(tempDir("dsh-wiki-incr-nometa-"));
+    writeIncrLive(noMeta, { meta: false });
+    const store2 = await openJournalStore({ storeDir: realpathSync(tempDir("dsh-wiki-journal-incr2-")), allowedRoots: [...incrRoots, noMeta], hostInstanceId: INCR_HOST });
+    const m2 = createJobManager(configOf({
+      journalStore: store2, hostInstanceId: INCR_HOST, allowedRoots: [...incrRoots, noMeta],
+      runBuilder: incrBuilder(), getSourceCommit: async () => HEAD, isAncestor: async () => true,
+    }));
+    const noBaseline = await m2.incrementalPlan(noMeta).then(() => null, (error) => error);
+    check("incremental baseline: a live wiki without any sourceCommit is a 409 incremental-no-baseline",
+      noBaseline?.status === 409 && noBaseline?.code === "incremental-no-baseline"
+      && /sourceCommit/i.test(noBaseline?.message ?? "") && /full update/i.test(noBaseline?.message ?? ""),
+      JSON.stringify({ status: noBaseline?.status, code: noBaseline?.code }));
+    const missing = await m2.incrementalPlan(tempDir("dsh-wiki-incr-nowiki-")).then(() => null, (error) => error);
+    check("incremental baseline: a repository with no published wiki is also 409 incremental-no-baseline",
+      missing?.status === 409 && missing?.code === "incremental-no-baseline", JSON.stringify({ code: missing?.code }));
+  }
+
+  // 15b. 祖先拒绝：基线不是 HEAD 的祖先（rebase/force-push）必须拒绝；“查不了”是另一个 code。
+  {
+    const diverged = incrManager({ isAncestor: async () => false });
+    const refused = await diverged.incrementalPlan(incrDiverged).then(() => null, (error) => error);
+    check("incremental ancestor: a baseline that is not an ancestor of HEAD is 409 incremental-baseline-diverged",
+      refused?.status === 409 && refused?.code === "incremental-baseline-diverged", JSON.stringify({ code: refused?.code }));
+    const unknownAncestor = incrManager({ isAncestor: async () => null });
+    const unavailable = await unknownAncestor.incrementalPlan(incrDiverged).then(() => null, (error) => error);
+    check("incremental ancestor: an unresolvable ancestor relation is 409 incremental-unavailable, not a downgrade",
+      unavailable?.status === 409 && unavailable?.code === "incremental-unavailable", JSON.stringify({ code: unavailable?.code }));
+    // HEAD 读不出来同样不是“全量”，而是 incremental-unavailable。
+    const noHead = incrManager({ getSourceCommit: async () => null });
+    const noHeadError = await noHead.incrementalPlan(incrDiverged).then(() => null, (error) => error);
+    check("incremental head: an unreadable HEAD is 409 incremental-unavailable",
+      noHeadError?.status === 409 && noHeadError?.code === "incremental-unavailable", JSON.stringify({ code: noHeadError?.code }));
+  }
+
+  // 15c. diff-impact 的每种失败（exit 2 / 非 JSON / 范围不符 / 形状不对）都映射成同一个 409，并携带首行。
+  {
+    const FAILURE_LINE = "[dsh-wiki] diff-impact failed: git is not installed or not on PATH";
+    const failBuilder = incrManager({
+      runBuilder: incrBuilder({ "diff-impact": () => ({ ok: false, code: 2, output: `${FAILURE_LINE}\n`, stdout: "" }) }),
+    });
+    const failed = await failBuilder.incrementalPlan(incrDiffFails).then(() => null, (error) => error);
+    check("incremental diff-impact: exit 2 is 409 incremental-unavailable carrying the builder's first line",
+      failed?.status === 409 && failed?.code === "incremental-unavailable" && failed?.builderLine === FAILURE_LINE
+      && (failed?.message ?? "").includes(FAILURE_LINE), JSON.stringify({ code: failed?.code, line: failed?.builderLine }));
+    // 公开首行去路径：宿主安装位置/仓库根绝不进响应体（原始首行只留在 builderRaw 与日志里）。
+    const pathish = incrManager({
+      runBuilder: incrBuilder({
+        "diff-impact": () => ({ ok: false, code: 2, output: `[dsh-wiki] diff-impact failed: repository path is not a directory: ${incrDiffFails}\n`, stdout: "" }),
+      }),
+    });
+    const pathFailure = await pathish.incrementalPlan(incrDiffFails).then(() => null, (error) => error);
+    check("incremental diff-impact: the public first line has its absolute paths replaced by <path>",
+      pathFailure?.builderLine === "[dsh-wiki] diff-impact failed: repository path is not a directory: <path>"
+      && pathFailure?.builderRaw?.includes(incrDiffFails) && !pathFailure?.message?.includes(incrDiffFails),
+      JSON.stringify({ safe: pathFailure?.builderLine, raw: pathFailure?.builderRaw?.slice(0, 80) }));
+    for (const [label, stdout] of [
+      ["stdout is not JSON", "not json"],
+      ["stdout is an array", "[]"],
+      ["from/to do not match", JSON.stringify({ from: sha("9"), to: HEAD, changedFiles: [], affectedPages: [], affectedCards: [], unmappedFiles: [] })],
+      ["an entry without a string id", JSON.stringify({ from: BASELINE, to: HEAD, changedFiles: [], affectedPages: [{ id: 7, matchedFiles: [] }], affectedCards: [], unmappedFiles: [] })],
+      ["an entry with an unsafe id", JSON.stringify({ from: BASELINE, to: HEAD, changedFiles: [], affectedPages: [{ id: "../escape", matchedFiles: [] }], affectedCards: [], unmappedFiles: [] })],
+      ["an unmapped path that escapes", JSON.stringify({ from: BASELINE, to: HEAD, changedFiles: [], affectedPages: [], affectedCards: [], unmappedFiles: ["../outside"] })],
+    ]) {
+      const managerOdd = incrManager({ runBuilder: incrBuilder({ "diff-impact": () => ({ ok: true, code: 0, output: "", stdout }) }) });
+      const error = await managerOdd.incrementalPlan(incrDiffFails).then(() => null, (thrown) => thrown);
+      check(`incremental diff-impact: ${label} is 409 incremental-unavailable`,
+        error?.status === 409 && error?.code === "incremental-unavailable", JSON.stringify({ code: error?.code, message: error?.message?.slice(0, 120) }));
+    }
+  }
+
+  // 15d. 没有已发布 canonical wiki 时播种是**硬失败**：作业失败、live 不动、暂存被清掉。
+  {
+    const live = path.join(incrSeedFails, ".dsh-wiki");
+    rmSync(path.join(live, "wiki.json"), { force: true });
+    const managerSeed = incrManager();
+    const started = start(managerSeed, incrSeedFails, { action: "update", incremental: await managerSeed.incrementalPlan(incrSeedFails) });
+    const done = await waitJob(managerSeed, incrSeedFails, (last) => last && last.phase !== "running");
+    check("incremental seed: a live wiki without wiki.json fails the job hard (live-missing) and publishes nothing",
+      started.phase === "running" && done.last?.phase === "failed" && done.last?.error?.code === "live-missing"
+      && done.last?.published === false && stagingDirs(incrSeedFails).length === 0,
+      JSON.stringify({ phase: done.last?.phase, code: done.last?.error?.code, staging: stagingDirs(incrSeedFails) }));
+    check("incremental seed: the failure is recorded at the seed stage, before any worker session",
+      done.last?.stage === "seed" && !env.events.includes("followup-after-seed"),
+      JSON.stringify({ stage: done.last?.stage, phase: done.last?.phase }));
+  }
+
+  // 15e. 一次真正的增量发布：只重写受影响的页，未受影响的页逐字节不变，sourceCommit 推进到 HEAD。
+  {
+    const live = writeIncrLive(incrRewrite);
+    const beforeBuild = readFileSync(path.join(live, "pages", "build.md"));
+    const beforeOverview = readFileSync(path.join(live, "pages", "overview.md"));
+    const managerRewrite = incrManager();
+    let promptText = null;
+    env.behavior = (agent, stage) => {
+      promptText = agent.followups.at(-1)?.content?.[0]?.text ?? null;
+      // worker 只改受影响的那一页（overview 命中 README.md）；build 页不在受影响集合里，一律不动。
+      writeFileSync(path.join(stage, "pages", "overview.md"), `---\nid: "overview"\nparentId: null\norder: 1\ntitle: "Overview"\ndescription: "d"\nfilePaths: ["README.md"]\n---\n# Overview\n\nRewritten. See \`README.md:2\`.\n`);
+      agent.events.push({ type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } });
+      agent.status = "idle";
+    };
+    const plan = await managerRewrite.incrementalPlan(incrRewrite);
+    const started = start(managerRewrite, incrRewrite, { action: "update", incremental: plan });
+    check("incremental job: start() accepts update + a resolved plan and reports the affected counts",
+      started.phase === "running" && started.incremental?.mode === "incremental"
+      && started.incremental?.affectedPages === 1 && started.incremental?.unmappedFiles === 1,
+      JSON.stringify(started.incremental));
+    const done = await waitJob(managerRewrite, incrRewrite, (last) => last && last.phase !== "running");
+    check("incremental job: the publish succeeds and reports how many pages were rewritten",
+      done.last?.phase === "done" && done.last?.published === true && done.last?.incremental?.pagesRewritten === 1,
+      JSON.stringify({ phase: done.last?.phase, inc: done.last?.incremental, error: done.last?.error }));
+    check("incremental job: the untouched page keeps its published bytes",
+      readFileSync(path.join(live, "pages", "build.md")).equals(beforeBuild) && !readFileSync(path.join(live, "pages", "overview.md")).equals(beforeOverview),
+      "build.md changed" );
+    check("incremental job: generation-meta.json advances sourceCommit to the diffed head",
+      (() => {
+        try {
+          return JSON.parse(readFileSync(path.join(live, "generation-meta.json"), "utf8")).sourceCommit === HEAD;
+        } catch { return false; }
+      })(), String(done.last?.incremental?.sourceCommit));
+    check("incremental prompt: the worker is told the affected ids and the unmapped files, and to leave others alone",
+      typeof promptText === "string" && promptText.includes("Incremental update")
+      && promptText.includes('"overview"') && promptText.includes('"README.md"')
+      && promptText.includes('"docs/notes.md"') && /byte-identical/.test(promptText)
+      && !promptText.includes('"build"'), String(promptText).slice(-800));
+    check("incremental job: staging is gone after the publish", stagingDirs(incrRewrite).length === 0, JSON.stringify(stagingDirs(incrRewrite)));
+  }
+
+  // 15f. 零改写：sourceCommit 绝不推进到 HEAD（spec 013 §5.1），不匹配由 pagesRewritten 如实暴露。
+  {
+    const live = writeIncrLive(incrZero);
+    const beforeMeta = JSON.parse(readFileSync(path.join(live, "generation-meta.json"), "utf8"));
+    const managerZero = incrManager();
+    env.behavior = (agent) => {
+      // worker 什么都没改：受影响集合里的页保持播种时的字节。
+      agent.events.push({ type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } });
+      agent.status = "idle";
+    };
+    const plan = await managerZero.incrementalPlan(incrZero);
+    start(managerZero, incrZero, { action: "update", incremental: plan });
+    const done = await waitJob(managerZero, incrZero, (last) => last && last.phase !== "running");
+    const meta = JSON.parse(readFileSync(path.join(live, "generation-meta.json"), "utf8"));
+    check("incremental zero-rewrite: the job still publishes but records pagesRewritten 0",
+      done.last?.phase === "done" && done.last?.incremental?.pagesRewritten === 0,
+      JSON.stringify({ phase: done.last?.phase, inc: done.last?.incremental }));
+    check("incremental zero-rewrite: sourceCommit stays at the baseline instead of claiming HEAD",
+      meta.sourceCommit === beforeMeta.sourceCommit && done.last?.incremental?.sourceCommitAdvanced === false
+      && done.last?.incremental?.affectedPages === 1,
+      JSON.stringify({ sourceCommit: meta.sourceCommit, baseline: beforeMeta.sourceCommit, inc: done.last?.incremental }));
+  }
+
+  // 15g. start() 的闸门与 prompt 的向后兼容。
+  {
+    const managerGate = incrManager();
+    const plan = await managerGate.incrementalPlan(incrBase);
+    const asGenerate = startErr(managerGate, incrBase, { action: "generate", incremental: plan });
+    check("incremental gate: start() refuses generate + a plan (400 incremental-not-for-generate)",
+      asGenerate?.status === 400 && asGenerate?.code === "incremental-not-for-generate", JSON.stringify({ code: asGenerate?.code }));
+    const asTranslate = startErr(managerGate, incrBase, { action: "translate", targetLang: "vi", incremental: plan });
+    check("incremental gate: start() refuses translate + a plan (400 incremental-not-for-translate)",
+      asTranslate?.status === 400 && asTranslate?.code === "incremental-not-for-translate", JSON.stringify({ code: asTranslate?.code }));
+    const malformed = startErr(managerGate, incrBase, { action: "update", incremental: { mode: "incremental", baseline: "not-a-sha", head: HEAD, pages: [], cards: [], unmappedFiles: [] } });
+    check("incremental gate: a malformed plan is 400 invalid-incremental, never a silent full rebuild",
+      malformed?.status === 400 && malformed?.code === "invalid-incremental", JSON.stringify({ code: malformed?.code }));
+    check("incremental gate: the three refusals left no fence and no staging",
+      managerGate.isBusy(incrBase) === false && stagingDirs(incrBase).length === 0);
+
+    // prompt 向后兼容：不带 incremental 时，字节必须与 spec 013 之前完全相同（这里按同一套模板重建）。
+    const jobId = "0123456789abcdef";
+    const stageDir = path.join(incrBase, `.dsh-wiki.staging-${jobId}`);
+    const plain = await buildWorkerPrompt({ jobId, root: incrBase, stageDir, config: EFFECTIVE });
+    const protocolText = readFileSync(path.join(here, "..", "skills", "worker-protocol.md"), "utf8")
+      .replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const legacyPrompt = `${[
+      "# dsh-wiki worker protocol (Host-pinned, canonical English)",
+      "",
+      protocolText.trimEnd(),
+      "",
+      "# Job",
+      "",
+      `Job id: ${JSON.stringify(jobId)}`,
+      `Repository root (absolute): ${JSON.stringify(incrBase)}`,
+      `Staging wiki directory (absolute): ${JSON.stringify(stageDir)}`,
+      `Target language: ${JSON.stringify("en")} (canonical English only; no other locale is written)`,
+      "",
+      "Effective configuration (validated, canonical JSON; do not change it):",
+      "```json",
+      JSON.stringify({
+        language: "en", granularity: "hybrid", pages: { min: 6, max: 16 }, tree: { maxChildren: 6, maxDepth: 4 },
+        wordsPerPage: [100, 3000], diagrams: "minimal", citations: "strict", skeleton: { knownIssues: true },
+      }, null, 2),
+      "```",
+      "",
+      "Write only `pages/<id>.md` and `cards/<id>.md` inside the staging wiki directory above.",
+    ].join("\n")}\n`;
+    check("worker prompt: without incremental the prompt is byte-identical to the pre-spec-013 prompt",
+      plain.prompt === legacyPrompt && !("incremental" in plain), `${plain.promptBytes} bytes`);
+    const withIncremental = await buildWorkerPrompt({
+      jobId, root: incrBase, stageDir, config: EFFECTIVE,
+      incremental: { baseline: BASELINE, head: HEAD, pages: [{ id: "overview", filePaths: ["README.md"] }], cards: [], unmappedFiles: ["docs/notes.md"] },
+    });
+    check("worker prompt: with incremental the section is appended and the job block is unchanged",
+      withIncremental.prompt.startsWith(plain.prompt.trimEnd())
+      && withIncremental.prompt.includes("Incremental update")
+      && withIncremental.promptSha256 !== plain.promptSha256, `${withIncremental.promptBytes} bytes`);
+    for (const [label, incremental] of [
+      ["an unknown key", { baseline: BASELINE, head: HEAD, pages: [], cards: [], unmappedFiles: [], extra: 1 }],
+      ["a non-array pages", { baseline: BASELINE, head: HEAD, pages: {}, cards: [], unmappedFiles: [] }],
+      ["an entry id that is not a string", { baseline: BASELINE, head: HEAD, pages: [{ id: 1, filePaths: [] }], cards: [], unmappedFiles: [] }],
+      ["a missing field", { baseline: BASELINE, head: HEAD, pages: [], cards: [] }],
+      ["an abbreviated baseline", { baseline: "1234567", head: HEAD, pages: [], cards: [], unmappedFiles: [] }],
+      ["too many entries", { baseline: BASELINE, head: HEAD, pages: Array.from({ length: 501 }, (_, index) => ({ id: `p${index}`, filePaths: [] })), cards: [], unmappedFiles: [] }],
+    ]) {
+      const refused = await buildWorkerPrompt({ jobId, root: incrBase, stageDir, config: EFFECTIVE, incremental })
+        .then(() => null, (error) => error);
+      check(`worker prompt: incremental with ${label} is refused (invalid-incremental)`,
+        refused?.code === "invalid-incremental", JSON.stringify({ code: refused?.code, message: String(refused?.message ?? "").slice(0, 140) }));
+    }
+  }
+
+  // 15h. 去重边界（review minor）：增量上限与 commit 形状只有**一份**定义，在 lib/incremental-limits.js
+  //      （一个不 import 任何东西的叶子模块）里；lib/jobs.js 与 lib/worker-protocol.js 各自 import 它。
+  //      这不放松 dormant 规则：jobs.js 仍然不 import ./worker-protocol.js（tools/worker-protocol-test.mjs
+  //      与 tools/jobs-worker-test.mjs 各有一条断言钉住它）。原来的两条“两份拷贝不能漂移”的比对检查因此
+  //      变成空转（同一份值不可能不同），已删除；留下的是“它真的只有一份定义”这一条，它会失败于任何
+  //      一方重新长出自己的拷贝。
+  {
+    const readSource = (name) => readFileSync(path.join(here, "..", "lib", name), "utf8");
+    const leaf = readSource("incremental-limits.js");
+    const jobsSrc = readSource("jobs.js");
+    const protocolSrc = readSource("worker-protocol.js");
+    const importsLeaf = (src) => /from\s+["']\.\/incremental-limits\.js["']/.test(src);
+    check("spec013 layering: INCREMENTAL_LIMITS and COMMIT_RE are defined once (lib/incremental-limits.js)",
+      /\bexport const INCREMENTAL_LIMITS\b/.test(leaf) && /\bexport const COMMIT_RE\b/.test(leaf)
+      && !/\bINCREMENTAL_LIMITS\s*=\s*Object\.freeze/.test(jobsSrc) && !/\bINCREMENTAL_LIMITS\s*=\s*Object\.freeze/.test(protocolSrc)
+      && !/\bCOMMIT_RE\s*=\s*\//.test(jobsSrc) && !/\bCOMMIT_RE\s*=\s*\//.test(protocolSrc)
+      && importsLeaf(jobsSrc) && importsLeaf(protocolSrc),
+      JSON.stringify({ leafLimits: /\bexport const INCREMENTAL_LIMITS\b/.test(leaf), jobsImports: importsLeaf(jobsSrc), protocolImports: importsLeaf(protocolSrc) }));
+    check("spec013 layering: the leaf module imports nothing (jobs.js stays clear of worker-protocol.js)",
+      !/^\s*import\s/m.test(leaf) && !/require\s*\(/.test(leaf) && !/import\s*\(/.test(leaf)
+      && !/from\s+["']\.\/worker-protocol(?:\.js)?["']/.test(jobsSrc),
+      JSON.stringify({ leafImportsNothing: !/^\s*import\s/m.test(leaf), jobsImportsProtocol: /from\s+["']\.\/worker-protocol(?:\.js)?["']/.test(jobsSrc) }));
+    check("spec013 layering: the shared limits still carry the documented caps",
+      JSON.stringify(INCREMENTAL_LIMITS) === JSON.stringify({ maxEntries: 500, maxFilePaths: 500, maxIdLength: 200, maxPathLength: 4096 }),
+      JSON.stringify(INCREMENTAL_LIMITS));
+  }
+
+  // 15i. 授权范围复核（review MAJOR）：plan 之外的条目被改写/删除 => incremental-unexpected-write，
+  //      候选一个字节都不发布、live wiki 不动；只动受影响集合 => 照常成功（绝无假阳性）。
+  //      这一节的每一页都必须是**已播种的**条目：incremental 路径先把 live 整棵播种到暂存，worker 再动它。
+  {
+    const AFFECTED_OVERVIEW = `---\nid: "overview"\nparentId: null\norder: 1\ntitle: "Overview"\ndescription: "d"\nfilePaths: ["README.md"]\n---\n# Overview\n\nRewritten. See \`README.md:2\`.\n`;
+    const VANDALISED_BUILD = `---\nid: "build"\nparentId: null\norder: 2\ntitle: "Build"\ndescription: "d"\nfilePaths: ["build.sh"]\n---\n# Build\n\nVandalised: a page the plan never authorised.\n`;
+    // 读不到就记 null：一个“越权写入被发布了”的失败必须以干净 FAIL 呈现，而不是让整个 harness 在
+    // ENOENT 上崩掉（那会顺带吃掉后面的用例）。
+    const readOrNull = (file) => { try { return readFileSync(file); } catch { return null; } };
+    // 整棵 live 树的字节指纹（目录也计入）：一个“什么都没发布”的断言必须覆盖整棵树，而不只是两页。
+    const liveTree = (root) => {
+      const lines = [];
+      const walk = (dir, prefix) => {
+        let names;
+        try {
+          names = readdirSync(dir, { withFileTypes: true });
+        } catch {
+          lines.push(`${prefix || "."}=<missing>`);
+          return;
+        }
+        for (const entry of names.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+          const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+          if (entry.isDirectory()) {
+            lines.push(`${relative}/`);
+            walk(path.join(dir, entry.name), relative);
+            continue;
+          }
+          const bytes = readOrNull(path.join(dir, entry.name));
+          lines.push(`${relative}=${bytes === null ? "<unreadable>" : createHash("sha256").update(bytes).digest("hex")}`);
+        }
+      };
+      walk(path.join(root, ".dsh-wiki"), "");
+      return lines.join("\n");
+    };
+    // 一个增量作业：misbehave(stage) 就是 worker 的全部行为，其余编排走真 jobs.js。
+    // builderOverrides 只用于“宿主自己的 assemble 重写了 wiki.json 也不许误报”这一类用例。
+    const runScopeCase = async (root, misbehave, builderOverrides = {}) => {
+      const before = liveTree(root);
+      const eventsBefore = env.events.length;
+      const managerScope = incrManager(Object.keys(builderOverrides).length === 0
+        ? {}
+        : { runBuilder: incrBuilder(builderOverrides) });
+      env.behavior = (agent, stage) => {
+        misbehave(stage);
+        agent.events.push({ type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } });
+        agent.status = "idle";
+      };
+      const plan = await managerScope.incrementalPlan(root);
+      start(managerScope, root, { action: "update", incremental: plan });
+      const done = await waitJob(managerScope, root, (last) => last && last.phase !== "running");
+      const after = liveTree(root);
+      return {
+        done,
+        liveChanged: after !== before,
+        staging: stagingDirs(root),
+        warnings: env.events.slice(eventsBefore).filter((entry) => typeof entry === "string" && entry.startsWith("warn:")),
+      };
+    };
+
+    // (1) 改写一个不在受影响集合里的页：build 不命中 diff-impact，它只能逐字节不变。
+    const rewritten = await runScopeCase(incrScopeRewrite, (stage) => {
+      writeFileSync(path.join(stage, "pages", "build.md"), VANDALISED_BUILD);
+    });
+    check("incremental scope: rewriting a page outside the affected set fails the job (409 incremental-unexpected-write)",
+      rewritten.done.last?.phase === "failed" && rewritten.done.last?.error?.code === "incremental-unexpected-write",
+      JSON.stringify({ phase: rewritten.done.last?.phase, error: rewritten.done.last?.error }));
+    check("incremental scope: that failure publishes nothing, leaves the live wiki byte-identical and counts no rewrite",
+      rewritten.done.last?.published === false && rewritten.liveChanged === false
+      && rewritten.done.last?.incremental?.pagesRewritten === null,
+      JSON.stringify({ published: rewritten.done.last?.published, liveChanged: rewritten.liveChanged, inc: rewritten.done.last?.incremental }));
+    check("incremental scope: the refusal is recorded at the scope stage and the staging tree is cleaned up",
+      rewritten.done.last?.stage === "incremental scope" && rewritten.staging.length === 0,
+      JSON.stringify({ stage: rewritten.done.last?.stage, staging: rewritten.staging }));
+    check("incremental scope: the caller sees the fixed sentence and the offending path only reaches the logger",
+      rewritten.done.last?.error?.message === PUBLIC_ERROR_MESSAGES["incremental-unexpected-write"]
+      && !/pages\//.test(rewritten.done.last?.error?.message ?? "")
+      && rewritten.warnings.some((line) => line.includes("pages/build.md")),
+      JSON.stringify({ message: rewritten.done.last?.error?.message, warnings: rewritten.warnings.slice(-1) }));
+
+    // (2) 删除一个不在受影响集合里的页：消失同样是一次越权写入。
+    const deleted = await runScopeCase(incrScopeDelete, (stage) => {
+      rmSync(path.join(stage, "pages", "build.md"));
+    });
+    check("incremental scope: deleting a page outside the affected set fails the job (409 incremental-unexpected-write)",
+      deleted.done.last?.phase === "failed" && deleted.done.last?.error?.code === "incremental-unexpected-write"
+      && deleted.done.last?.published === false && deleted.liveChanged === false,
+      JSON.stringify({ phase: deleted.done.last?.phase, error: deleted.done.last?.error, liveChanged: deleted.liveChanged }));
+    check("incremental scope: the deletion is named in the internal diagnostic, not in the public error",
+      deleted.warnings.some((line) => line.includes("pages/build.md"))
+      && deleted.done.last?.error?.message === PUBLIC_ERROR_MESSAGES["incremental-unexpected-write"]
+      && deleted.staging.length === 0,
+      JSON.stringify({ warnings: deleted.warnings.slice(-1), staging: deleted.staging }));
+
+    // (3) 什么都不动：没有越权，就没有假阳性，作业照常发布。
+    const clean = await runScopeCase(incrScopeClean, () => {});
+    check("incremental scope: a worker that leaves every seeded entry alone still succeeds (no false positive)",
+      clean.done.last?.phase === "done" && clean.done.last?.published === true
+      && clean.done.last?.incremental?.pagesRewritten === 0,
+      JSON.stringify({ phase: clean.done.last?.phase, published: clean.done.last?.published, inc: clean.done.last?.incremental }));
+
+    // (4) 只重写受影响的那一页：通过，且 pagesRewritten 就是 1。
+    const affectedOnly = await runScopeCase(incrScopeAffected, (stage) => {
+      writeFileSync(path.join(stage, "pages", "overview.md"), AFFECTED_OVERVIEW);
+    });
+    check("incremental scope: rewriting exactly the affected set still succeeds and counts one rewritten page",
+      affectedOnly.done.last?.phase === "done" && affectedOnly.done.last?.published === true
+      && affectedOnly.done.last?.incremental?.pagesRewritten === 1,
+      JSON.stringify({ phase: affectedOnly.done.last?.phase, inc: affectedOnly.done.last?.incremental, error: affectedOnly.done.last?.error }));
+
+    // (5) 非法 UTF-8：两份**不同**的坏字节解码后是同一个 U+FFFD 文本。如果哈希的是解码后的字符串，
+    //     这次改写就会漏掉；只有哈希盘上的原始字节才抓得住它。
+    const buildHeader = Buffer.from(`---\nid: "build"\nparentId: null\norder: 2\ntitle: "Build"\ndescription: "d"\nfilePaths: ["build.sh"]\n---\n# Build\n\n`, "utf8");
+    const badA = Buffer.concat([buildHeader, Buffer.from([0xff])]);
+    const badB = Buffer.concat([buildHeader, Buffer.from([0xfe])]);
+    check("incremental scope: the invalid-byte fixture is two different byte sequences with one decoded text",
+      !badA.equals(badB) && badA.toString("utf8") === badB.toString("utf8") && badA.toString("utf8").endsWith("\ufffd"),
+      `${badA.length}/${badB.length}`);
+    writeFileSync(path.join(incrScopeBytes, ".dsh-wiki", "pages", "build.md"), badA);
+    const invalidBytes = await runScopeCase(incrScopeBytes, (stage) => {
+      writeFileSync(path.join(stage, "pages", "build.md"), badB);
+    });
+    check("incremental scope: two different invalid byte sequences in an untouched page are still detected as a change",
+      invalidBytes.done.last?.phase === "failed" && invalidBytes.done.last?.error?.code === "incremental-unexpected-write"
+      && invalidBytes.done.last?.published === false && invalidBytes.liveChanged === false && invalidBytes.staging.length === 0,
+      JSON.stringify({ phase: invalidBytes.done.last?.phase, error: invalidBytes.done.last?.error, liveChanged: invalidBytes.liveChanged }));
+
+    // (6) wiki.json 的非 pages/cards 顶层键（review MAJOR）：assemble 会重写 pages/cards，但标题之类的
+    //     键是发布的元数据。只哈希 pages/ 与 cards/ 时，这次改写完全无人察觉地进了发布。
+    const wikiKey = await runScopeCase(incrScopeWikiKey, (stage) => {
+      const file = path.join(stage, "wiki.json");
+      const wiki = JSON.parse(readFileSync(file, "utf8"));
+      wiki.title = "Hijacked: a title the plan never authorised";
+      writeFileSync(file, JSON.stringify(wiki));
+    });
+    check("incremental scope: rewriting a non-pages/cards top-level key of wiki.json fails the job (409 incremental-unexpected-write)",
+      wikiKey.done.last?.phase === "failed" && wikiKey.done.last?.error?.code === "incremental-unexpected-write"
+      && wikiKey.done.last?.published === false && wikiKey.liveChanged === false && wikiKey.staging.length === 0,
+      JSON.stringify({ phase: wikiKey.done.last?.phase, error: wikiKey.done.last?.error, liveChanged: wikiKey.liveChanged }));
+    check("incremental scope: the wiki.json key is named in the internal diagnostic, not in the public error",
+      wikiKey.warnings.some((line) => line.includes("wiki.json#title"))
+      && wikiKey.done.last?.error?.message === PUBLIC_ERROR_MESSAGES["incremental-unexpected-write"]
+      && !/wiki\.json/.test(wikiKey.done.last?.error?.message ?? ""),
+      JSON.stringify({ warnings: wikiKey.warnings.slice(-1), message: wikiKey.done.last?.error?.message }));
+
+    // (7) worker 在暂存根新增一个顶层文件：它也会随整树发布，所以同样是越权写入。
+    const extraFile = await runScopeCase(incrScopeExtraFile, (stage) => {
+      writeFileSync(path.join(stage, "extra.md"), "# injected at the staging root\n");
+    });
+    check("incremental scope: a new top-level file added by the worker fails the job (409 incremental-unexpected-write)",
+      extraFile.done.last?.phase === "failed" && extraFile.done.last?.error?.code === "incremental-unexpected-write"
+      && extraFile.done.last?.published === false && extraFile.liveChanged === false && extraFile.staging.length === 0,
+      JSON.stringify({ phase: extraFile.done.last?.phase, error: extraFile.done.last?.error, liveChanged: extraFile.liveChanged }));
+    check("incremental scope: the added file is named in the internal diagnostic",
+      extraFile.warnings.some((line) => line.includes("extra.md")),
+      JSON.stringify({ warnings: extraFile.warnings.slice(-1) }));
+
+    // (8) 新增的**空目录**（没有任何文件）：目录也进快照（只记 kind），所以它同样可检测。
+    const emptyDir = await runScopeCase(incrScopeEmptyDir, (stage) => {
+      mkdirSync(path.join(stage, "stray"), { recursive: true });
+    });
+    check("incremental scope: a new empty directory added by the worker fails the job (409 incremental-unexpected-write)",
+      emptyDir.done.last?.phase === "failed" && emptyDir.done.last?.error?.code === "incremental-unexpected-write"
+      && emptyDir.done.last?.published === false && emptyDir.liveChanged === false && emptyDir.staging.length === 0,
+      JSON.stringify({ phase: emptyDir.done.last?.phase, error: emptyDir.done.last?.error, liveChanged: emptyDir.liveChanged }));
+    check("incremental scope: the empty directory is named in the internal diagnostic",
+      emptyDir.warnings.some((line) => line.includes("stray")),
+      JSON.stringify({ warnings: emptyDir.warnings.slice(-1) }));
+
+    // (9) 宿主 assemble 自己重写 wiki.json 的 pages/cards 时**不许**误报：这个比较发生在 assemble 之前。
+    //     用例让 assemble 桩真的替换 pages 与 cards（不是原样写回），后缀仍然发布成功。
+    const assembleRewrites = await runScopeCase(incrScopeAssemble, () => {}, {
+      assemble: (job) => {
+        const file = path.join(job.stageDir, "wiki.json");
+        const wiki = JSON.parse(readFileSync(file, "utf8"));
+        wiki.pages = [
+          { id: "overview", parentId: null, order: 1, title: "Overview", markdown: INCR_PAGE_A },
+          { id: "build", parentId: null, order: 2, title: "Build", markdown: INCR_PAGE_B },
+        ];
+        wiki.cards = [{ id: "assembled-card", title: "Assembled", kind: "concept", summary: "one line" }];
+        writeFileSync(file, `${JSON.stringify(wiki, null, 1)}\n`);
+        return { ok: true, code: 0, output: "", stdout: "" };
+      },
+    });
+    check("incremental scope: assemble's own rewrite of wiki.json pages/cards is not a false failure",
+      assembleRewrites.done.last?.phase === "done" && assembleRewrites.done.last?.published === true,
+      JSON.stringify({ phase: assembleRewrites.done.last?.phase, error: assembleRewrites.done.last?.error }));
+    check("incremental scope: the published wiki.json keeps assemble's rewritten pages/cards",
+      (() => {
+        try {
+          const published = JSON.parse(readFileSync(path.join(incrScopeAssemble, ".dsh-wiki", "wiki.json"), "utf8"));
+          return Array.isArray(published.pages) && published.pages.length === 2
+            && Array.isArray(published.cards) && published.cards[0]?.id === "assembled-card";
+        } catch { return false; }
+      })(),
+      JSON.stringify({ keys: (() => { try { return Object.keys(JSON.parse(readFileSync(path.join(incrScopeAssemble, ".dsh-wiki", "wiki.json"), "utf8"))); } catch { return null; } })() }));
+
+    // (10) HEAD == 基线：没有事可做 => 显式拒绝，绝不开一个空转的 worker 会话，也不留栅栏/暂存。
+    const upToDateManager = incrManager({ getSourceCommit: async () => BASELINE });
+    const upToDate = await upToDateManager.incrementalPlan(incrBase).then(() => null, (error) => error);
+    check("incremental up-to-date: HEAD == the published baseline is refused (409 incremental-up-to-date)",
+      upToDate?.status === 409 && upToDate?.code === "incremental-up-to-date"
+      && /matches HEAD/i.test(upToDate?.message ?? "") && /full update/i.test(upToDate?.message ?? ""),
+      JSON.stringify({ status: upToDate?.status, code: upToDate?.code, message: String(upToDate?.message ?? "").slice(0, 160) }));
+    check("incremental up-to-date: the refusal starts no job and leaves no fence or staging behind",
+      upToDateManager.isBusy(incrBase) === false && upToDateManager.view(incrBase).active === null
+      && stagingDirs(incrBase).length === 0,
+      JSON.stringify({ active: upToDateManager.view(incrBase).active, staging: stagingDirs(incrBase) }));
+    check("incremental up-to-date: the public sentence is fixed and suggests a full update, with no path in it",
+      PUBLIC_ERROR_MESSAGES["incremental-up-to-date"] === "the published wiki already matches HEAD; run a full update if the wiki is stale for another reason"
+      && !/[\\/]/.test(PUBLIC_ERROR_MESSAGES["incremental-up-to-date"]),
+      String(PUBLIC_ERROR_MESSAGES["incremental-up-to-date"]));
+
+    // 15k. worker 停下之后的 front-matter id 复核（review MAJOR，D1）：授权范围检查**故意跳过**受影响集合，
+    //      所以受影响页可以自由改写——包括它的 id。而 assemble 按**声明的 id** 建页：把受影响页的 id
+    //      改成一个不受影响页的 id，发布时就会顶替那一页。规则与计划阶段同一条：声明的 id 要么缺席
+    //      （id 由文件名决定），要么等于这个文件的 stem；否则 incremental-unexpected-write，绝不发布。
+    {
+      const overviewHeader = (idLine) => `---\n${idLine}parentId: null\norder: 1\ntitle: "Overview"\ndescription: "d"\nfilePaths: ["README.md"]\n---\n# Overview\n\nRewritten. See \`README.md:2\`.\n`;
+      // (a) 受影响页把自己的 id 改成一个**不受影响**的页（build）：这正是 id-mapping 检查关掉的洞的
+      //     另一侧——发布时它会顶替 build 页。
+      const retargeted = await runScopeCase(incrIdRetarget, (stage) => {
+        writeFileSync(path.join(stage, "pages", "overview.md"), overviewHeader(`id: "build"\n`));
+      });
+      check("incremental ids: an affected page retargeted onto an unaffected page's id fails the job (409 incremental-unexpected-write)",
+        retargeted.done.last?.phase === "failed"
+        && retargeted.done.last?.error?.code === "incremental-unexpected-write",
+        JSON.stringify({ phase: retargeted.done.last?.phase, error: retargeted.done.last?.error }));
+      check("incremental ids: the retarget publishes nothing, leaves the live wiki byte-identical and counts no rewrite",
+        retargeted.done.last?.published === false && retargeted.liveChanged === false
+        && retargeted.done.last?.incremental?.pagesRewritten === null
+        && retargeted.done.last?.incremental?.pagesRemoved === null,
+        JSON.stringify({ published: retargeted.done.last?.published, liveChanged: retargeted.liveChanged, inc: retargeted.done.last?.incremental }));
+      check("incremental ids: the offending staged key is named only in the internal diagnostic, never in the public error",
+        retargeted.warnings.some((line) => line.includes("pages/overview.md"))
+        && retargeted.done.last?.error?.message === PUBLIC_ERROR_MESSAGES["incremental-unexpected-write"]
+        && !/pages\//.test(retargeted.done.last?.error?.message ?? ""),
+        JSON.stringify({ warnings: retargeted.warnings.slice(-1), message: retargeted.done.last?.error?.message }));
+      check("incremental ids: the retarget is refused at the id stage, before the scope check, and staging is cleaned up",
+        retargeted.done.last?.stage === "incremental ids" && retargeted.staging.length === 0,
+        JSON.stringify({ stage: retargeted.done.last?.stage, staging: retargeted.staging }));
+
+      // (b) 声明的 id 等于自己的文件名：合法，绝不许误判（live 页本来没有 front-matter）。
+      const ownId = await runScopeCase(incrIdSelf, (stage) => {
+        writeFileSync(path.join(stage, "pages", "overview.md"), overviewHeader(`id: "overview"\n`));
+      });
+      check("incremental ids: an affected page whose declared id equals its own file name still publishes (no false failure)",
+        ownId.done.last?.phase === "done" && ownId.done.last?.published === true
+        && ownId.done.last?.incremental?.pagesRewritten === 1
+        && ownId.done.last?.incremental?.pagesRemoved === 0,
+        JSON.stringify({ phase: ownId.done.last?.phase, inc: ownId.done.last?.incremental, error: ownId.done.last?.error }));
+
+      // (c) 整个 front-matter 块被去掉：id = 文件名（与 assemble 的 `setdefault("id", f.stem)` 一致），
+      //     同样合法。
+      const noBlock = await runScopeCase(incrIdNoBlock, (stage) => {
+        writeFileSync(path.join(stage, "pages", "overview.md"), `# Overview\n\nRewritten without front matter. See \`README.md:3\`.\n`);
+      });
+      check("incremental ids: an affected page whose front-matter block was removed entirely still publishes (id = file name)",
+        noBlock.done.last?.phase === "done" && noBlock.done.last?.published === true
+        && noBlock.done.last?.incremental?.pagesRewritten === 1
+        && noBlock.done.last?.incremental?.pagesRemoved === 0,
+        JSON.stringify({ phase: noBlock.done.last?.phase, inc: noBlock.done.last?.incremental, error: noBlock.done.last?.error }));
+    }
+
+    // 15l. 受影响页被删除（review MAJOR，D2）：允许（仓库里被删掉的主题本来就应该下线），但必须**看得见**
+    //      ——pagesRemoved + removedSample，而且绝不算进 pagesRewritten。
+    {
+      const pageRemoved = await runScopeCase(incrPageDelete, (stage) => {
+        rmSync(path.join(stage, "pages", "overview.md"));
+      });
+      check("incremental removals: a removed affected page publishes, with pagesRewritten 0 and pagesRemoved 1 (never conflated)",
+        pageRemoved.done.last?.phase === "done" && pageRemoved.done.last?.published === true
+        && pageRemoved.done.last?.incremental?.pagesRewritten === 0
+        && pageRemoved.done.last?.incremental?.pagesRemoved === 1,
+        JSON.stringify({ phase: pageRemoved.done.last?.phase, inc: pageRemoved.done.last?.incremental, error: pageRemoved.done.last?.error }));
+      check("incremental removals: the removal is visible in the job state by name (removedSample)",
+        Array.isArray(pageRemoved.done.last?.incremental?.removedSample)
+        && pageRemoved.done.last.incremental.removedSample.length === 1
+        && pageRemoved.done.last.incremental.removedSample[0] === "overview",
+        JSON.stringify(pageRemoved.done.last?.incremental?.removedSample));
+      check("incremental removals: the published wiki no longer carries the removed page (the disappearance is real, not silent)",
+        pageRemoved.done.last?.published === true
+        && existsSync(path.join(incrPageDelete, ".dsh-wiki", "pages", "overview.md")) === false
+        && existsSync(path.join(incrPageDelete, ".dsh-wiki", "pages", "build.md")) === true,
+        JSON.stringify({
+          overview: existsSync(path.join(incrPageDelete, ".dsh-wiki", "pages", "overview.md")),
+          build: existsSync(path.join(incrPageDelete, ".dsh-wiki", "pages", "build.md")),
+        }));
+      check("incremental removals: the removal advances the recorded sourceCommit to the diffed head",
+        (() => {
+          try {
+            return JSON.parse(readFileSync(path.join(incrPageDelete, ".dsh-wiki", "generation-meta.json"), "utf8")).sourceCommit === HEAD;
+          } catch { return false; }
+        })() && pageRemoved.done.last?.incremental?.sourceCommitAdvanced === true,
+        String(pageRemoved.done.last?.incremental?.sourceCommitAdvanced));
+
+      // 受影响**卡片**的删除没有对应的公开事实，所以宁可失败也不让它无声消失（fail closed）。
+      const cardRemoved = await runScopeCase(incrCardDelete, (stage) => {
+        rmSync(path.join(stage, "cards", "glossary.md"));
+      }, {
+        "diff-impact": () => ({
+          ok: true, code: 0, output: "", stdout: JSON.stringify({
+            from: BASELINE, to: HEAD, changedFiles: ["README.md"],
+            affectedPages: [{ id: "overview", title: "Overview", matchedFiles: ["README.md"] }],
+            affectedCards: [{ id: "glossary", title: "Glossary", matchedFiles: ["README.md"] }],
+            unmappedFiles: [],
+          }),
+        }),
+      });
+      check("incremental removals: removing an affected card is refused instead of disappearing silently (409 incremental-unexpected-write)",
+        cardRemoved.done.last?.phase === "failed"
+        && cardRemoved.done.last?.error?.code === "incremental-unexpected-write"
+        && cardRemoved.done.last?.published === false && cardRemoved.liveChanged === false
+        && cardRemoved.staging.length === 0,
+        JSON.stringify({ phase: cardRemoved.done.last?.phase, error: cardRemoved.done.last?.error, liveChanged: cardRemoved.liveChanged }));
+      check("incremental removals: the removed card is named in the internal diagnostic, not in the public error",
+        cardRemoved.warnings.some((line) => line.includes("cards/glossary.md"))
+        && cardRemoved.done.last?.error?.message === PUBLIC_ERROR_MESSAGES["incremental-unexpected-write"],
+        JSON.stringify({ warnings: cardRemoved.warnings.slice(-1), message: cardRemoved.done.last?.error?.message }));
+    }
+  }
+  // 15j. 受影响 id 与已发布文件一一对应（review minor）：受影响集合按 id 拼 `pages/<id>.md`，而文件名
+  //      不一定等于 front-matter 的 id。不一致会让受影响页的合法重写被判越权（假失败），也会让一个 id
+  //      落到携带**另一个** id 的文件上（改写那一页）。拒绝整个计划、一个作业都不开（409），不猜。
+  {
+    const mismatchManager = incrManager();
+    const mismatched = await mismatchManager.incrementalPlan(incrIdMismatch).then(() => null, (error) => error);
+    check("incremental id mapping: a page whose front-matter id differs from its file name is refused (409 incremental-id-mismatch)",
+      mismatched?.status === 409 && mismatched?.code === "incremental-id-mismatch",
+      JSON.stringify({ status: mismatched?.status, code: mismatched?.code, message: String(mismatched?.message ?? "").slice(0, 200) }));
+    check("incremental id mapping: the refusal starts no job and leaves no fence or staging behind",
+      mismatchManager.isBusy(incrIdMismatch) === false && mismatchManager.view(incrIdMismatch).last === null
+      && stagingDirs(incrIdMismatch).length === 0,
+      JSON.stringify({ busy: mismatchManager.isBusy(incrIdMismatch), staging: stagingDirs(incrIdMismatch) }));
+    check("incremental id mapping: the public sentence is fixed, says the ids and file names disagree, and points at a full update",
+      PUBLIC_ERROR_MESSAGES["incremental-id-mismatch"] === "the published wiki's ids and file names disagree, so an incremental update is not safe for it; run a full update instead"
+      && /ids and file names disagree/.test(PUBLIC_ERROR_MESSAGES["incremental-id-mismatch"])
+      && /full update/.test(PUBLIC_ERROR_MESSAGES["incremental-id-mismatch"])
+      && !/[\\/]/.test(PUBLIC_ERROR_MESSAGES["incremental-id-mismatch"]),
+      String(PUBLIC_ERROR_MESSAGES["incremental-id-mismatch"]));
+
+    // 受影响 id 指向一个不存在的文件：授权范围无从谈起，同样拒绝（不是“什么都不用改”）。
+    const missingFile = await incrManager().incrementalPlan(incrIdMissing).then(() => null, (error) => error);
+    check("incremental id mapping: an affected id with no <id>.md file in the published wiki is refused (409 incremental-id-mismatch)",
+      missingFile?.status === 409 && missingFile?.code === "incremental-id-mismatch",
+      JSON.stringify({ status: missingFile?.status, code: missingFile?.code }));
+
+    // 反面：导入的 wiki（pages/*.md 没有 front-matter，id 由文件名决定）是**合法**形状，绝不许拒绝，
+    // 而且真的重写受影响的那一页仍然发布成功。
+    const noFrontMatter = incrManager();
+    const plan = await noFrontMatter.incrementalPlan(incrNoFrontMatter);
+    check("incremental id mapping: a published page without front-matter is accepted (imported wikis keep working)",
+      plan?.pages?.[0]?.id === "overview", JSON.stringify(plan?.pages ?? null));
+    env.behavior = (agent, stage) => {
+      writeFileSync(path.join(stage, "pages", "overview.md"), `# Overview\n\nRewritten. See \`README.md:2\`.\n`);
+      agent.events.push({ type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } });
+      agent.status = "idle";
+    };
+    start(noFrontMatter, incrNoFrontMatter, { action: "update", incremental: plan });
+    const done = await waitJob(noFrontMatter, incrNoFrontMatter, (last) => last && last.phase !== "running");
+    check("incremental id mapping: rewriting the affected page of a front-matter-less wiki still publishes",
+      done.last?.phase === "done" && done.last?.published === true && done.last?.incremental?.pagesRewritten === 1,
+      JSON.stringify({ phase: done.last?.phase, error: done.last?.error, inc: done.last?.incremental }));
+  }
+  env.behavior = null;
 }
 
 console.log(FAILS.length ? `\n${FAILS.length} FAILED` : "\nALL PASS");

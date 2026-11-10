@@ -978,5 +978,235 @@ check("generate: startSession error -> fallback", ok === false);
     !/https?:\/\//.test(src) && (src.match(/window\.open\(/g) || []).length === 1);
 }
 
+// ---- spec 013 §3: with a wiki and the gate open the primary action is a *labelled* incremental
+//      update; a full rebuild stays an explicit menu item (the only correct action without a
+//      baseline or when diff-impact is unavailable); a Host refusal is shown verbatim and is never
+//      retried as a full rebuild. ----
+{
+  const t = (k) => mod._test.DICT.en[k] ?? k;
+  const en = mod._test.DICT.en, zh = mod._test.DICT.zh;
+  const HOST_REASON = "Background wiki jobs are disabled pending filesystem isolation and recovery review";
+  const NO_BASELINE = "there is no published wiki with a usable sourceCommit to update incrementally; run a full update first";
+  const OPEN_GATE = { known: true, disabled: false, reason: "" };
+  const CLOSED_GATE = { known: true, disabled: true, reason: HOST_REASON };
+  const ROOT = "C:\\R";
+  const BASELINE = "dd02d64f5b0c9a71c2e4d8f3a6b1c9e2d4f60a17";
+  const HEAD = "a4ce6ba8e1f7c3d29b6a5e4d8c1f0b7a2e9d3c46";
+  const catalog = {
+    phase: "ready", def: { provider: "r9-fallback", model: "ds41" }, failures: [],
+    models: [{ provider: "r9-fallback", model: "ds41", label: "DS41", providerLabel: "r9-fallback" }],
+  };
+  const model = { provider: "r9-fallback", model: "ds41" };
+  const info = { root: ROOT, title: "R", generated: true, hasSite: false, pageCount: 31, cardCount: 25, language: "en",
+    sourceCommit: BASELINE, updatedAt: null, updateAvailable: true, head: HEAD };
+  const wiki = { root: ROOT, title: "R", language: "en",
+    pages: [{ id: "p1", parentId: null, order: 1, title: "Page One", description: "", filePaths: [], markdown: "# Page One" }], cards: [] };
+  const incFacts = (extra) => ({
+    mode: "incremental", baseline: BASELINE, head: HEAD, affectedPages: 23, affectedCards: 9,
+    pagesRewritten: null, unmappedFiles: 102, unmappedSample: [".dsh-wiki/wiki.json"],
+    sourceCommit: null, sourceCommitAdvanced: null, ...extra,
+  });
+  const elements = (node, out = []) => {
+    if (node === null || node === undefined || node === false) return out;
+    if (Array.isArray(node)) { node.forEach((n) => elements(n, out)); return out; }
+    if (typeof node === "object" && node.props) { out.push(node); elements(node.props.children, out); }
+    return out;
+  };
+  const buttons = (node) => elements(node).filter((n) => n.type === "button");
+  const primaryBtn = (node) => buttons(node).filter((b) => String(b.props.className).includes("dw-btn primary"));
+  const render = (el) => renderToStaticMarkup(el);
+  // 直接调 Detail 得到的是“未展开”的元素树：其中的 JobControls/LanguageSelect 还是元素。
+  // 这几个组件都不含 hook，所以展开一层等于 React 渲染一层，且能拿到真实的 props.onClick。
+  const expand = (node, out = []) => {
+    if (node === null || node === undefined || node === false) return out;
+    if (Array.isArray(node)) { node.forEach((n) => expand(n, out)); return out; }
+    if (typeof node === "object" && node.props) {
+      if (typeof node.type === "function") return expand(node.type(node.props), out);
+      out.push(node);
+      expand(node.props.children, out);
+    }
+    return out;
+  };
+
+  // ---- the labels themselves: both dictionaries, and distinct from the full actions ----
+  check("incremental: the primary label says incremental in en + zh and is not the plain update label",
+    en["job.updateIncremental"] === "Update wiki (incremental)" && /增量/.test(zh["job.updateIncremental"])
+    && en["job.updateIncremental"] !== en["job.update"] && zh["job.updateIncremental"] !== zh["job.update"],
+    JSON.stringify([en["job.updateIncremental"], zh["job.updateIncremental"]]));
+  check("incremental: the full rebuild has its own label in en + zh, distinct from generate and update",
+    en["btn.rebuild"] === "Rebuild whole wiki" && !!zh["btn.rebuild"] && /wiki/i.test(zh["btn.rebuild"])
+    && en["btn.rebuild"] !== en["job.generate"] && en["btn.rebuild"] !== en["job.update"]
+    && zh["btn.rebuild"] !== zh["job.generate"] && zh["btn.rebuild"] !== zh["job.update"],
+    JSON.stringify([en["btn.rebuild"], zh["btn.rebuild"]]));
+
+  // ---- the primary control: label, and the request it asks for ----
+  const genHtml = render(React.createElement(mod._test.JobControls,
+    { t, root: ROOT, generated: true, catalog, model, job: null, busy: false, gate: OPEN_GATE,
+      onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {} }));
+  check("incremental: with a wiki and the open gate the primary button is the incremental update",
+    genHtml.includes("↻ Update wiki (incremental)") && primaryBtn(mod._test.JobControls({ t, root: ROOT, generated: true,
+      catalog, model, job: null, busy: false, gate: OPEN_GATE, onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {} })).length === 1,
+    genHtml.slice(0, 400));
+  const starts = [];
+  const primaryEl = primaryBtn(mod._test.JobControls({ t, root: ROOT, generated: true, catalog, model, job: null, busy: false,
+    gate: OPEN_GATE, onStart: (...a) => starts.push(a), onCancel() {}, onOpenSession() {}, onCopy() {} }))[0];
+  primaryEl.props.onClick();
+  check("incremental: the primary asks for action:update with incremental:true (label and request agree)",
+    starts.length === 1 && starts[0][0] === "update" && starts[0][2] && starts[0][2].incremental === true,
+    JSON.stringify(starts));
+  const newHtml = render(React.createElement(mod._test.JobControls,
+    { t, root: ROOT, generated: false, catalog, model, job: null, busy: false, gate: OPEN_GATE,
+      onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {} }));
+  check("incremental: a project with no wiki still offers a plain generate, never an incremental update",
+    newHtml.includes("✨ Generate wiki") && !newHtml.includes("incremental"), newHtml.slice(0, 300));
+  // 闸门关闭时这一步完全不变（spec 013 §3 第 3 条）：唯一的禁用主按钮还是今天那句，不带增量字样
+  const closedHtml = render(React.createElement(mod._test.JobControls,
+    { t, root: ROOT, generated: true, catalog, model, job: null, busy: false, gate: CLOSED_GATE,
+      onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {}, onCopyCommand() {} }));
+  check("incremental: a closed gate keeps today's single disabled primary (no incremental wording)",
+    /<button[^>]*class="dw-btn primary"[^>]*disabled=""[^>]*>↻ Update wiki<\/button>/.test(closedHtml)
+    && !/incremental/i.test(closedHtml) && !closedHtml.includes('class="dw-job"'), closedHtml.slice(0, 400));
+
+  // ---- while an incremental job runs: the affected counts; a full job shows today's line ----
+  const runningBase = { id: "j7", root: ROOT, action: "update", targetLang: "en", phase: "running", stage: "agent",
+    model: { provider: "r9-fallback", model: "ds41" }, startedAt: new Date().toISOString(), sessionId: null, pages: null };
+  const incRunning = render(React.createElement(mod._test.JobControls,
+    { t, root: ROOT, generated: true, catalog, model, busy: true, gate: OPEN_GATE,
+      job: { ...runningBase, incremental: incFacts({}) }, onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {} }));
+  check("incremental: a running incremental job reports the affected pages and cards",
+    incRunning.includes("Affected: 23 pages, 9 cards") && /role="progressbar"/.test(incRunning)
+    && incRunning.includes("Writing pages and cards"), incRunning.slice(0, 600));
+  const incMissing = render(React.createElement(mod._test.JobControls,
+    { t, root: ROOT, generated: true, catalog, model, busy: true, gate: OPEN_GATE,
+      job: { ...runningBase, incremental: { mode: "incremental" } }, onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {} }));
+  check("incremental: unknown affected counts render a dash, never an invented zero",
+    incMissing.includes("Affected: — pages, — cards") && !incMissing.includes("Affected: 0"), incMissing.slice(0, 500));
+  const fullRunning = render(React.createElement(mod._test.JobControls,
+    { t, root: ROOT, generated: true, catalog, model, busy: true, gate: OPEN_GATE,
+      job: runningBase, onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {} }));
+  check("incremental: a full job keeps today's progress line (no incremental counts at all)",
+    !fullRunning.includes("Affected") && /role="progressbar"/.test(fullRunning) && fullRunning.includes("Writing pages and cards"),
+    fullRunning.slice(0, 500));
+
+  // ---- on completion: pagesRewritten, and the unmapped files said plainly ----
+  const doneJob = (extra) => ({ ...runningBase, phase: "done", stage: "done", pages: 31,
+    incremental: incFacts({ pagesRewritten: 21, sourceCommit: HEAD, sourceCommitAdvanced: true, ...extra }) });
+  const incDone = render(React.createElement(mod._test.JobControls,
+    { t, root: ROOT, generated: true, catalog, model, busy: false, gate: OPEN_GATE,
+      job: doneJob({}), onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {} }));
+  check("incremental: the done line reports the rewritten pages and the uncovered changed files",
+    incDone.includes("21 pages rewritten") && incDone.includes("102 changed files not covered by any page")
+    && incDone.includes("Finished and published"), incDone.slice(0, 700));
+  check("incremental: unmapped files are never described as code nobody documented",
+    !/nobody documented|no one documented|undocumented/i.test(incDone)
+    && !/nobody documented|no one documented|undocumented/i.test(en["job.incUnmapped"] + " " + zh["job.incUnmapped"]),
+    en["job.incUnmapped"]);
+  const coveredDone = render(React.createElement(mod._test.JobControls,
+    { t, root: ROOT, generated: true, catalog, model, busy: false, gate: OPEN_GATE,
+      job: doneJob({ unmappedFiles: 0 }), onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {} }));
+  check("incremental: no uncovered-files note when every changed file is covered",
+    coveredDone.includes("21 pages rewritten") && !coveredDone.includes("not covered by any page"), coveredDone.slice(0, 600));
+  const fullDone = render(React.createElement(mod._test.JobControls,
+    { t, root: ROOT, generated: true, catalog, model, busy: false, gate: OPEN_GATE,
+      job: { ...runningBase, phase: "done", stage: "done", pages: 12 }, onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {} }));
+  check("incremental: a full job's done line is unchanged (page count only, no incremental facts)",
+    fullDone.includes("Finished and published") && fullDone.includes("(12 pages)")
+    && !fullDone.includes("rewritten") && !fullDone.includes("not covered"), fullDone.slice(0, 600));
+
+  // ---- the request actually sent: Detail.startJob ----
+  const posted = [];
+  let postResponse = () => ({ ok: true, status: 202, json: () => Promise.resolve({ ok: true, id: "j1" }) });
+  const jsonRes = (status, body) => ({ ok: status >= 200 && status < 300, status, json: () => Promise.resolve(body) });
+  const fetchStub = (url, init) => {
+    const u = String(url);
+    const body = init && init.body ? JSON.parse(init.body) : null;
+    posted.push({ url: u, body });
+    if (u.indexOf("/api/jobs/cancel") >= 0) return Promise.resolve(jsonRes(200, { ok: true }));
+    if (body && body.action) return Promise.resolve(postResponse());
+    // /api/jobs 轮询必须回答 disabled:false，否则面板会按闸门关闭重画，拒绝提示就没地方落脚
+    return Promise.resolve(jsonRes(200, { ok: true, disabled: false, active: null, last: null }));
+  };
+  const hk = { at: 0, states: [], effects: [] };
+  const mkHookReact = (h) => ({
+    createElement: React.createElement, Fragment: React.Fragment, createContext: React.createContext,
+    useState: (init) => {
+      const i = h.at++;
+      if (!(i in h.states)) h.states[i] = typeof init === "function" ? init() : init;
+      return [h.states[i], (v) => { h.states[i] = typeof v === "function" ? v(h.states[i]) : v; }];
+    },
+    useRef: (init) => ({ current: init }),
+    useEffect: (fn) => { h.effects.push(fn); },
+    useCallback: (fn) => fn,
+    useMemo: (fn) => fn(),
+    useContext: () => null,
+  });
+  let incMod = null;
+  const sb = {
+    window: {
+      __ModuleLoader__: { load: (spec) => { incMod = spec.factory((name) => {
+        if (name === "react") return mkHookReact(hk);
+        throw new Error("unexpected require " + name);
+      }); } },
+      dispatchEvent: () => true,
+    },
+    CustomEvent: function (type, init) { this.type = type; this.detail = (init && init.detail) || {}; },
+    console, setTimeout, clearTimeout, Promise, Object, Array, String, Number, Math, Date, RegExp, JSON,
+    fetch: (url, init) => fetchStub(url, init),
+  };
+  vm.runInNewContext(readFileSync(path.join(import.meta.dirname, "..", "lib", "client.js"), "utf8"), sb);
+  incMod.apply({ effect: (fn) => fn(), locale: { register: () => () => {} },
+    slots: { inject: (_k, fn) => fn(), register: () => () => {} } });
+  const detailProps = { t, project: { root: ROOT, title: "R", generated: true }, back() {},
+    catalog, model, onModel() {} };
+  // Detail hook order: data, lang, sel, showSrc, q, open, menu, toast, useJobView, useLanguages, notice
+  const seedDetail = (menu) => {
+    hk.at = 0; hk.effects.length = 0;
+    hk.states = [{ phase: "ready", info, wiki, missing: false, error: null }, "en", null, false, "", Object.create(null),
+      !!menu, null, { active: null, last: null, gate: OPEN_GATE }, { phase: "ready", tags: [], error: null }, null];
+  };
+  const renderDetail = () => { hk.at = 0; return incMod._test.Detail(detailProps); };
+  const jobPosts = () => posted.filter((p) => p && p.body);
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  seedDetail(false);
+  posted.length = 0;
+  primaryBtn(expand(renderDetail()))[0].props.onClick();
+  await flush();
+  check("incremental: the panel's primary POSTs action:update + incremental:true and nothing else",
+    jobPosts().length === 1 && jobPosts()[0].body.action === "update" && jobPosts()[0].body.incremental === true
+    && jobPosts()[0].body.targetLang === "en" && !("generate" in jobPosts()[0].body), JSON.stringify(jobPosts()));
+
+  seedDetail(true);
+  posted.length = 0;
+  const menuEl = expand(renderDetail());
+  const rebuildBtn = buttons(menuEl).filter((b) => String(b.props.children) === en["btn.rebuild"])[0];
+  if (rebuildBtn) rebuildBtn.props.onClick();
+  await flush();
+  check("incremental: the explicit rebuild menu item POSTs action:update with no incremental key",
+    !!rebuildBtn && jobPosts().length === 1 && jobPosts()[0].body.action === "update"
+    && !Object.prototype.hasOwnProperty.call(jobPosts()[0].body, "incremental"), JSON.stringify(jobPosts()));
+  seedDetail(true);
+  // 没有 wiki 的项目：菜单里只有“在会话中生成”，没有可重建的东西
+  hk.states[0] = { phase: "ready", info: { ...info, generated: false, pageCount: 0, cardCount: 0, sourceCommit: null }, wiki: null, missing: false, error: null };
+  const noWikiMenu = expand(incMod._test.Detail(detailProps));
+  check("incremental: the rebuild item is not offered to a project that has no wiki to rebuild",
+    !buttons(noWikiMenu).some((b) => String(b.props.children) === en["btn.rebuild"])
+    && buttons(noWikiMenu).some((b) => String(b.props.children) === en["btn.generate"]),
+    JSON.stringify(buttons(noWikiMenu).map((b) => String(b.props.children))));
+
+  // 宿主拒绝（409 incremental-no-baseline）：原话照登，且不自动改发一次全量重建
+  postResponse = () => jsonRes(409, { error: NO_BASELINE, code: "incremental-no-baseline" });
+  seedDetail(false);
+  posted.length = 0;
+  primaryBtn(expand(renderDetail()))[0].props.onClick();
+  await flush();
+  const refusedHtml = render(renderDetail());
+  check("incremental: a Host refusal is shown verbatim, not replaced by invented text",
+    refusedHtml.includes(NO_BASELINE) && /class="dw-joberr" role="alert"/.test(refusedHtml), refusedHtml.slice(0, 800));
+  check("incremental: a refusal is never retried as a full rebuild automatically",
+    jobPosts().length === 1 && jobPosts()[0].body.action === "update" && jobPosts()[0].body.incremental === true
+    && !jobPosts().some((p) => p.body.action === "generate"), JSON.stringify(jobPosts()));
+}
+
 console.log(FAILS.length ? `\n${FAILS.length} FAILED` : "\nALL PASS");
 process.exit(FAILS.length ? 1 : 0);

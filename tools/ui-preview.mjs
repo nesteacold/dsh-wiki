@@ -1,5 +1,7 @@
 // dsh-wiki 面板 UI 预览：把 lib/client.js 的真实 Detail 概览渲染成一个自包含的 HTML 文件，
-// 供人截图看排版（七种状态：五种常规宽度 + 两个停靠窄面板，后者正是闸门提示条最容易塌的地方）。
+// 供人截图看排版（十种状态：七种常规宽度 + 两个停靠窄面板，后者正是闸门提示条最容易塌的地方）。
+// 其中 h/i/j 三格是 spec 013 的增量作业：进行中显示受影响页/卡，完成行显示重写页数与未映射文件，
+// j 另外显示“删除 1 页”（被删的页必须看得见，不能静静地消失）。
 // 用法：
 //   node tools/ui-preview.mjs [输出路径]
 // 默认写到 %TEMP%\dsh-wiki-ui-preview.html。不联网、不开服务、不启动浏览器：写一个文件就退出 0。
@@ -127,6 +129,31 @@ const RUNNING_JOB = {
   startedAt: new Date(Date.now() - 83000).toISOString(),
   sessionId: "sess-9c1a4f7b2e6d", pages: 12,
 };
+// 增量作业（spec 013）的公开事实形状取自 lib/jobs.js publicIncremental：只有增量作业带这个键，
+// 全量作业的进度行/完成行因此与上面那个 RUNNING_JOB 完全一致。
+// 数字用实测语料（DXVK_Project dd02d64..67a1131）：23 页 / 9 卡受影响、102 个变更文件没有页面覆盖。
+// unmappedSample 故意包含 .dsh-wiki/：wiki 更新本身就会出现在未映射文件里。
+const INCREMENTAL_FACTS = {
+  mode: "incremental", baseline: SOURCE_COMMIT, head: HEAD,
+  affectedPages: 23, affectedCards: 9, pagesRewritten: null, unmappedFiles: 102,
+  unmappedSample: [".dsh-wiki/wiki.json", ".dsh-wiki/generation-meta.json"],
+  sourceCommit: null, sourceCommitAdvanced: null,
+};
+const INCREMENTAL_RUNNING_JOB = { ...RUNNING_JOB, incremental: INCREMENTAL_FACTS };
+const INCREMENTAL_DONE_JOB = {
+  ...RUNNING_JOB, phase: "done", stage: "done", sessionId: null, pages: 31, published: true,
+  incremental: { ...INCREMENTAL_FACTS, pagesRewritten: 21, sourceCommit: HEAD, sourceCommitAdvanced: true },
+};
+// 增量作业**删掉**一个页（D2）：完成行必须把这件事说出来，否则那一页只是从面板里静静消失。
+// 计数用实测语料（受影响 23 页 / 9 卡、重写 2 页、删除 1 页、102 个变更文件没有页面覆盖）；
+// removedSample 的 id 只进诊断，面板不显示。
+const INCREMENTAL_REMOVED_JOB = {
+  ...RUNNING_JOB, phase: "done", stage: "done", sessionId: null, pages: 30, published: true,
+  incremental: {
+    ...INCREMENTAL_FACTS, pagesRewritten: 2, pagesRemoved: 1, removedSample: ["journal"],
+    sourceCommit: HEAD, sourceCommitAdvanced: true,
+  },
+};
 
 const PANELS = [
   {
@@ -187,6 +214,33 @@ const PANELS = [
     project: { root: ROOT, title: "dsh-ext", generated: false, workspaceId: null },
     data: { phase: "ready", info: infoMissing, wiki: null, missing: false, error: null },
     jobView: { active: null, last: null, gate: CLOSED_GATE },
+  },
+  // spec 013 §3：增量作业进行中 —— 进度区显示受影响范围（N 页 / M 卡）；卡片标题里的主按钮此时是
+  // “Update wiki (incremental)”（自重写范围来自宿主作业状态，面板不猜）。
+  {
+    caption: "h · light · gate open · incremental update running (affected pages/cards)",
+    dark: false,
+    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "w-dsh-ext" },
+    data: { phase: "ready", info: infoCurrent, wiki: WIKI, missing: false, error: null },
+    jobView: { active: INCREMENTAL_RUNNING_JOB, last: null, gate: OPEN_GATE },
+  },
+  // spec 013 §3：增量作业完成 —— 完成行报告“21 页已重写”和“102 个变更文件未被任何页面覆盖”。
+  // 后者不是“没人写文档的代码”：.dsh-wiki/ 自己被提交，所以一次 wiki 更新也会落进这一项。
+  {
+    caption: "i · dark · gate open · incremental update finished (rewritten pages + uncovered changed files)",
+    dark: true,
+    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "w-dsh-ext" },
+    data: { phase: "ready", info: infoGenerated, wiki: WIKI, missing: false, error: null },
+    jobView: { active: null, last: INCREMENTAL_DONE_JOB, gate: OPEN_GATE },
+  },
+  // spec 013 §3 / D2：增量作业删掉了一个页 —— 完成行除了“重写 2 页”还必须说“删除 1 页”，
+  // 只报重写会让页面的消失无声（removedSample 的 id 只在诊断里，不进口袋面板）。
+  {
+    caption: "j · light · gate open · incremental update finished, removed a page",
+    dark: false,
+    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "w-dsh-ext" },
+    data: { phase: "ready", info: infoGenerated, wiki: WIKI, missing: false, error: null },
+    jobView: { active: null, last: INCREMENTAL_REMOVED_JOB, gate: OPEN_GATE },
   },
 ];
 
@@ -289,7 +343,7 @@ function main() {
     "<style>" + PREVIEW_CSS + "\n" + mod._test.CSS + "</style>",
     "</head><body>",
     '<h1 class="pv-title">dsh-wiki · overview panel</h1>',
-    '<p class="pv-note">Rendered from lib/client.js with canned state · zero external requests · ' + PANELS.length + " states · a–d and g at panel width, e/f forced to 460px/464px</p>",
+    '<p class="pv-note">Rendered from lib/client.js with canned state · zero external requests · ' + PANELS.length + " states · a–d, g, h, i, j at panel width, e/f forced to 460px/464px</p>",
     '<main class="pv-page">',
     body,
     "</main>",
