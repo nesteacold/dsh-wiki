@@ -20,7 +20,7 @@
     <img src="docs/assets/badges/license.svg" alt="MIT License">
     <img src="docs/assets/badges/dsh.svg" alt="DSH 0.2.x compatible">
     <img src="docs/assets/badges/python.svg" alt="Python ≥3.7">
-    <img src="docs/assets/badges/tests.svg" alt="tests: 217 builder, 113 translation, 412 host, 157 module job, 99 worker pipeline, 64 protocol, 145 client, 302 trusted-journal/containment/guard/liveness checks">
+    <img src="docs/assets/badges/tests.svg" alt="tests: 217 builder, 113 translation, 412 host, 192 module job, 64 differential, 99 worker pipeline, 64 protocol, 145 client, 302 trusted-journal/containment/guard/liveness checks">
     <img src="docs/assets/badges/network.svg" alt="zero network">
   </p>
 
@@ -329,7 +329,8 @@ Host-side route fence: loopback Host check + directory basename must equal `wiki
 python3 tests/test_build_wiki_site.py   # 217 builder regression checks (injection PoCs, SVG sanitizing, config merge, node --check on site scripts, citation resolution incl. unique-basename fallback)
 python3 tests/test_wiki_translations.py # 113 translation-policy checks (structural SHA-256 per typed unit)
 node tools/harness-test.mjs             # 412 host-half checks (skill / commands / routes / trust fence / subagent paths, plus job-gate, language API and body-read response wiring)
-node tools/jobs-harness-test.mjs        # 157 module-level job checks (drives lib/jobs.js directly, incl. starved-deadline, chunked-overflow and hostile-input regressions)
+node tools/jobs-harness-test.mjs        # 192 module-level job checks (drives lib/jobs.js directly, incl. starved-deadline, chunked-overflow and hostile-input regressions)
+node tools/frontmatter-differential-test.mjs # 64 differential checks (58 front-matter shapes: the extracted JS reader vs the real python assemble reader; 0 leaks; exits 2 rather than passing when python is absent)
 node tools/jobs-worker-test.mjs         # 99 worker-pipeline checks (prompt/guard/journal/publish-executor/translate seeding)
 node tools/worker-protocol-test.mjs     # 64 protocol checks (1 POSIX-only case skipped on Windows)
 node tools/client-smoke.mjs <react> <react-dom>  # 145 client checks (grid/detail/cards, markdown safety, zoom + focus trap, model selector, language selector, job controls)

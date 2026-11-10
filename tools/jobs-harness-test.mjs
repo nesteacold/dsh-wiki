@@ -1452,6 +1452,11 @@ check("after dispose, new jobs are refused (503 plugin-unloaded)",
     tempDir("dsh-wiki-incr-idretarget-"), tempDir("dsh-wiki-incr-idself-"),
     tempDir("dsh-wiki-incr-idsnofm-"), tempDir("dsh-wiki-incr-pagedelete-"),
     tempDir("dsh-wiki-incr-carddelete-"),
+    // 15m 两个解析器读同一份字节（review round 4）：单字符 CR 换行、两个 BOM、CRLF 自查 id、
+    // 无 front-matter 的 Windows 形状，以及 Python 会直接拒绝的块（本读取器必须一并拒绝）。
+    tempDir("dsh-wiki-incr-idlonecr-"), tempDir("dsh-wiki-incr-idbom2-"),
+    tempDir("dsh-wiki-incr-idcrlfself-"), tempDir("dsh-wiki-incr-idnocfmtcrlf-"),
+    tempDir("dsh-wiki-incr-idrefusedblock-"),
   ].map((value) => realpathSync(value));
   const [
     incrBase, incrFlat, incrDiverged, incrDiffFails, incrSeedFails, incrRewrite, incrZero,
@@ -1459,6 +1464,7 @@ check("after dispose, new jobs are refused (503 plugin-unloaded)",
     incrScopeWikiKey, incrScopeExtraFile, incrScopeEmptyDir, incrScopeAssemble,
     incrIdMismatch, incrIdMissing, incrNoFrontMatter,
     incrIdRetarget, incrIdSelf, incrIdNoBlock, incrPageDelete, incrCardDelete,
+    incrIdLoneCr, incrIdBom2, incrIdCrlfSelf, incrIdNoCfmtCrlf, incrIdRefusedBlock,
   ] = incrRoots;
   const INCR_PAGE_A = "# Overview\n\nSee `README.md:1`.\n";
   const INCR_PAGE_B = "# Build\n\nSee `build.sh:1`.\n";
@@ -2067,6 +2073,82 @@ check("after dispose, new jobs are refused (503 plugin-unloaded)",
         && noBlock.done.last?.incremental?.pagesRewritten === 1
         && noBlock.done.last?.incremental?.pagesRemoved === 0,
         JSON.stringify({ phase: noBlock.done.last?.phase, inc: noBlock.done.last?.incremental, error: noBlock.done.last?.error }));
+    }
+
+    // 15m. 两个解析器对同一份字节必须给出同一个答案（review round 4，本轮最高优先级缺陷）。
+    //      增量检查读 front-matter 的是 lib/jobs.js，assemble 读它的是 Python（scripts/build_wiki_site.py：
+    //      `f.read_text(encoding="utf-8")` 的通用换行 + `lstrip("\ufeff")`）。两者不一致 => 检查形同虚设：
+    //      JS 说“没有声明 id”（放行），Python 读到 id: build，发布时这一页顶替 build 页。
+    //      下面每个用例都是一个曾经（或曾经会）真实放行的形状。
+    {
+      const overviewHeader = (idLine) => `---\n${idLine}parentId: null\norder: 1\ntitle: "Overview"\ndescription: "d"\nfilePaths: ["README.md"]\n---\n# Overview\n\nRewritten. See \`README.md:2\`.\n`;
+      const refusedLike = (outcome) => ({
+        phase: outcome.done.last?.phase,
+        code: outcome.done.last?.error?.code,
+        published: outcome.done.last?.published,
+        liveChanged: outcome.liveChanged,
+        stage: outcome.done.last?.stage,
+        staging: outcome.staging.length,
+      });
+
+      // (d) 单字符 CR 换行（bypass #1）：JS 只归一化 `\r\n`，这段文本因此不以 `---\n` 开头 =>“无声明 id”
+      //     => 放行；Python 的通用换行把单独的 `\r` 也当换行，读到 id: build。
+      const loneCr = await runScopeCase(incrIdLoneCr, (stage) => {
+        writeFileSync(path.join(stage, "pages", "overview.md"), overviewHeader(`id: "build"\n`).replace(/\n/g, "\r"));
+      });
+      check("incremental ids: a lone-CR front matter declaring an unaffected page's id is refused (bypass: only \\r\\n was normalised, so the block looked absent)",
+        loneCr.done.last?.phase === "failed" && loneCr.done.last?.error?.code === "incremental-unexpected-write",
+        JSON.stringify(refusedLike(loneCr)));
+      check("incremental ids: the lone-CR retarget publishes nothing, leaves the live wiki byte-identical and names the page only internally",
+        loneCr.done.last?.published === false && loneCr.liveChanged === false && loneCr.staging.length === 0
+        && loneCr.done.last?.stage === "incremental ids"
+        && loneCr.warnings.some((line) => line.includes("pages/overview.md"))
+        && loneCr.done.last?.error?.message === PUBLIC_ERROR_MESSAGES["incremental-unexpected-write"],
+        JSON.stringify({ ...refusedLike(loneCr), warnings: loneCr.warnings.slice(-1), message: loneCr.done.last?.error?.message }));
+
+      // (e) 两个 BOM（bypass #2）：JS 只去掉一个前导 U+FEFF => 同上“无声明 id”；Python 的 lstrip("\ufeff")
+      //     去掉任意个前导 BOM，读到 id: build。
+      const bom2 = await runScopeCase(incrIdBom2, (stage) => {
+        writeFileSync(path.join(stage, "pages", "overview.md"), `\ufeff\ufeff${overviewHeader(`id: "build"\n`)}`);
+      });
+      check("incremental ids: a two-BOM front matter declaring an unaffected page's id is refused (bypass: only one leading U+FEFF was stripped)",
+        bom2.done.last?.phase === "failed" && bom2.done.last?.error?.code === "incremental-unexpected-write",
+        JSON.stringify(refusedLike(bom2)));
+      check("incremental ids: the two-BOM retarget publishes nothing and leaves the live wiki byte-identical",
+        bom2.done.last?.published === false && bom2.liveChanged === false && bom2.staging.length === 0
+        && bom2.warnings.some((line) => line.includes("pages/overview.md")),
+        JSON.stringify(refusedLike(bom2)));
+
+      // (f) CRLF 且声明**自己**的 id：Windows 编辑器产出的形状，归一化之后必须照常发布（绝不许假失败）。
+      const crlfSelf = await runScopeCase(incrIdCrlfSelf, (stage) => {
+        writeFileSync(path.join(stage, "pages", "overview.md"), overviewHeader(`id: "overview"\n`).replace(/\n/g, "\r\n"));
+      });
+      check("incremental ids: a CRLF front matter that declares its own id still publishes (no false failure: Windows editors write CRLF)",
+        crlfSelf.done.last?.phase === "done" && crlfSelf.done.last?.published === true
+        && crlfSelf.done.last?.incremental?.pagesRewritten === 1
+        && crlfSelf.done.last?.incremental?.pagesRemoved === 0,
+        JSON.stringify({ phase: crlfSelf.done.last?.phase, inc: crlfSelf.done.last?.incremental, error: crlfSelf.done.last?.error }));
+
+      // (g) 完全没有 front-matter 块（BOM + CRLF 的 Windows 形状）：id = 文件名，照常发布。
+      const noCfmtCrlf = await runScopeCase(incrIdNoCfmtCrlf, (stage) => {
+        writeFileSync(path.join(stage, "pages", "overview.md"), `\ufeff# Overview\r\n\r\nRewritten without front matter. See \`README.md:3\`.\r\n`);
+      });
+      check("incremental ids: a BOM+CRLF page with no front-matter block still publishes (id = file name, no false failure)",
+        noCfmtCrlf.done.last?.phase === "done" && noCfmtCrlf.done.last?.published === true
+        && noCfmtCrlf.done.last?.incremental?.pagesRewritten === 1,
+        JSON.stringify({ phase: noCfmtCrlf.done.last?.phase, inc: noCfmtCrlf.done.last?.incremental, error: noCfmtCrlf.done.last?.error }));
+
+      // (h) 说不清的块必须**拒绝**，而不是“没有 id”（fail closed）：这一行的形状 assemble 的 Python 读取器
+      //     会直接 sys.exit（front-matter lines must be key: value），旧的 JS 读取器却跳过它并放行。
+      const refusedBlock = await runScopeCase(incrIdRefusedBlock, (stage) => {
+        writeFileSync(path.join(stage, "pages", "overview.md"), `---\nid: "overview"\n- not a key value line\nparentId: null\norder: 1\ntitle: "Overview"\ndescription: "d"\nfilePaths: ["README.md"]\n---\n# Overview\n\nRewritten. See \`README.md:2\`.\n`);
+      });
+      check("incremental ids: a front-matter line assemble's reader would reject is refused, never read as 'no declared id' (fail closed)",
+        refusedBlock.done.last?.phase === "failed" && refusedBlock.done.last?.error?.code === "incremental-unexpected-write",
+        JSON.stringify(refusedLike(refusedBlock)));
+      check("incremental ids: the unprovable block publishes nothing and leaves the live wiki byte-identical",
+        refusedBlock.done.last?.published === false && refusedBlock.liveChanged === false && refusedBlock.staging.length === 0,
+        JSON.stringify(refusedLike(refusedBlock)));
     }
 
     // 15l. 受影响页被删除（review MAJOR，D2）：允许（仓库里被删掉的主题本来就应该下线），但必须**看得见**
