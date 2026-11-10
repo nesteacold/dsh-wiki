@@ -11,6 +11,30 @@
   `UPSTREAM.md`），这三次的安全与健壮性修复是审计本仓库代码的前提。上游 v0.2.0、v0.2.1
   两个 tag 里没有 `CHANGELOG.md`，其条目是在 v0.2.2 时补写的。
 
+## 0.2.1 — 未发布（spec `specs/007-wiki-pipeline-i18n-models` 第一切片；后台作业被发布闸门关闭）
+
+面板内后台 Generate / Update 与模型选择器已实现，但 **2026-11-09 评审后整段关闭**，直到写路径具备真正的文件系统隔离、恢复（recovery）可信为止。当前对外契约：
+
+- `GET /dsh-wiki/api/models`：唯一仍可用的接口（只读），来自 `sessionController.modelCatalog()`；服务缺失 503。它只列出模型，不生成任何东西——本版本**没有活的生成能力**。
+- `POST /dsh-wiki/api/jobs` 与 `POST /dsh-wiki/api/jobs/cancel`：一律 **503** `{ error: <闸门消息>, disabled: true }`，在读取请求体、解析 Host 服务、触碰任何路径之前返回（`translate` 同样是 503，不再是 501）。
+- `GET /dsh-wiki/api/jobs?root=`：200 disabled 负载 `{ ok, root, disabled: true, disabledReason, active: null, last: null }`；宿主**不构造**作业管理器。未知 root 仍 403（白名单仍在）。
+- 只读路由不再调用 `recover()`：`GET /api/projects|project|wiki|site` 不会把崩溃遗留的 `.dsh-wiki.bak-*` 改名，查看 wiki 是纯读操作（旧实现会在普通读取时重命名任意备份目录，等于读接口触发写）。
+
+为什么关：后台作业启动的是普通模型会话，**没有文件系统隔离**（提示词级的「别碰 live `.dsh-wiki`」不是沙箱）；而只读 GET 里的 `recover()` 会在查看时改动文件系统。隔离 + 可信恢复落地前不开闸；开闸的正确方式是先完成这两项，再把 `lib/jobs.js` 的作业管理器接回 `lib/index.js`（现场注释已写明，不要只改常量）。
+
+本切片另落地两处能力与一处措辞修正：
+
+- 站点 chrome 支持越南语：`wiki.json` 的 `language` 为 `vi*` 时全站 chrome 用越南语，`zh*` 用中文，其余（默认）英文；页面**正文**语言另行由 resolve-config 的 `language` 字段决定，本切片保持 canonical `en`。
+- 新子命令 `diff-impact`（只读）：把 `<from>..<to>` 的改动文件映射到受影响页面/卡片，输出 `from`、`to`、`changedFiles`、`affectedPages`、`affectedCards`、`unmappedFiles`；按精确路径或目录前缀匹配 `filePaths`/`keyFiles`，不构建、不写盘、不联网，失败退出 2。
+- 修正技能文档里关于引用机检的表述：机检只覆盖单个反引号包裹、白名单扩展名、ASCII 路径的 `path:line`/`start-end` 形态，其余形态不受检，仓库根不可用时降级为警告——作者须自行核对每条引用。
+
+保留与测试：
+
+- `lib/jobs.js` 的实现保留在树上：暂存发布（候选写 `<repo>/.dsh-wiki.staging-<jobId>/`，必须 `wiki.json.repoId` 指向仓库根，build + selfcheck 都退出 0 才发布）、canonical `en` 语言门、宿主所有的 `config.json`/`locales/` 原样保留（拒绝符号链接）、单飞栅栏（任何 `await` 之前同步插入）、取消/隔离/等待输入、超时、备份恢复，以及同源/JSON/32KB/项目白名单/精确模型等写栅栏。**但本版本不接线**（`lib/index.js` 不构造管理器）。
+- `tools/jobs-harness-test.mjs` 改为**模块级** harness（直接 `createJobManager()`；51 项）作为 future/internal 契约，**不声称是活路由行为**；活路由契约（POST 503、GET disabled、读路由不 `recover()`）由 `tools/harness-test.mjs` 第 19 节覆盖（含"查看不得改动文件系统"的备份原地不动断言）。
+- 客户端：模型选择器 UI 仍在，但闸门期间应视为**禁用/惰性**——选择只改下拉值，Generate/Update 启动即 503，不会出现活动作业；主屏与项目概览仍共用同一选择。P1 修复保留（无原型 id 字典、缩放浮层焦点陷阱、去掉自造 `dsh:select-panel` 兜底）。
+- 测试：构建器 111 项、宿主 harness 73 项、作业模块 harness 51 项（future/internal）全绿；客户端冒烟 61 项本次未改动客户端，沿用上次结果。
+
 ## 0.2.0 — 未发布
 
 知识卡片与生成体验（spec `specs/004-wiki-knowledge-cards`，dsh-ext）。`wiki.json` schema 仍为 `repo-wiki-local/1`；无卡片的 wiki 构建输出与 0.1.x 逐字节一致（时间戳除外）。

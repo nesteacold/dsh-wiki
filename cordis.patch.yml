@@ -1,10 +1,86 @@
-# dsh-wiki：为 profile 追加本插件的一个 loader 行。
-# 安装 = `dsh plugin --profile <name> add @dsh-ext/dsh-wiki`（自动把本包追加进 dsh.profile.bundles）。
+# dsh-wiki: adds one loader row for this plugin to the profile.
+# Install: `dsh plugin --profile <name> add @dsh-ext/dsh-wiki` (appends this package to dsh.profile.bundles).
 - insert:
     - id: dsh-wiki
       name: "@dsh-ext/dsh-wiki"
       config:
-        # 各仓库内 wiki 产物目录名（仓库相对）
+        # Name of the wiki output folder inside each repository (repo-relative)
         wikiDirName: .dsh-wiki
-        # 额外扫描的 wiki 根目录（绝对路径数组；会话工作区及其同级目录会被自动发现，无需手填）
+        # Extra wiki roots to scan (absolute paths); session workspaces and their siblings/children are discovered automatically
         wikiRoots: []
+        # Background jobs (spec 007). OFF by default: the enablement gates T018-T020 are not
+        # cleared, so the block is commented out in the committed state. Setting `jobs.enabled: true`
+        # wires the job manager, worker guard, preset and trusted journal; any construction failure
+        # keeps the routes 503.
+        # 2026-11-10 OWNER-AUTHORIZED TRANSLATE RUNS — owner: "Có — 1 job dịch sang tiếng Việt, publish
+        # vào wiki live". Run 1 (92de59dc03f74b2d) was CANCELED BY ME for safety: the worker translated
+        # the CANONICAL pages/cards in place instead of locales/vi/. Design error in the brief, not a
+        # model failure; live wiki proven byte-identical afterwards. Fix = locale mirror as the worker's
+        # guard-scoped work area + post-worker canonical re-seed from live.
+        # Run 2 (f3e902e5a6c24d98) PUBLISHED: phase=done, journal=published, pages=31, ~10.4 min,
+        # protocolSha256 1b28110a... (translation protocol, distinct from generation d669f9e4...).
+        # Verified: canonical aggregate SHA-256 UNCHANGED vs pre-run baseline; check-translation --lang vi
+        # exit 0 (31/31 pages, 25/25 cards, 0 invalid/missing/stale); selfcheck exit 0 with 491/491
+        # citations; /api/languages -> [{"tag":"vi","units":true}]; /api/wiki?lang=vi translated, no root
+        # in body; ?lang=EN -> 404 (no silent normalisation). Config reverted to OFF below.
+        # Detail: docs/arch-notes/dsh-wiki-translate-run1-wrong-tree-20261110.md
+        #
+        # 2026-11-10 OWNER-AUTHORIZED RUN 4 — one job (owner: "Cho phép Run4"), then reverted to OFF.
+        # Same commit (dd02d64), same model, same config as RUN 2/3; protocol is the only variable.
+        # Expected protocolSha256: d669f9e4... (the T041 ruleset) — CONFIRMED in the journal record.
+        # job 385b048b8c394c07, 09:04-09:20 (~16 min), phase=failed stage=selfcheck, NOTHING PUBLISHED.
+        # It passed the content gate (T040 works), assemble and build, then failed selfcheck on exactly
+        # ONE citation of 431: page repository-operations wrote the bare shorthand `ROADMAP.md:4` while
+        # citing the real file six times as specs/005-goal-and-roadmap/ROADMAP.md. Not a hallucination —
+        # an abbreviation the resolver rejects. Recovered by replaying the worker transcript (392 zstd
+        # frames), then re-running assemble/build/selfcheck on the reconstructed candidate.
+        # Confinement MEASURED: the worker tried list_agents once and the guard refused it
+        # ("not permitted for a wiki worker (allowed: read, glob, grep, write, edit)").
+        # The candidate was deliberately NOT published: live RUN 2 wiki is better (491/491 citations,
+        # 25 cards vs 14). Detail: docs/arch-notes/dsh-wiki-run4-diagnosis-20261110.md
+        #
+        # 2026-11-10 OWNER-AUTHORIZED RUN 3 — one job, then reverted (owner: "1. cho phép").
+        # Same commit (dd02d64), same config as RUN 2, same model => protocol is the only variable.
+        # Expected protocolSha256: 9a169c73efd8dd959a3226ed286bbd0f5ca00c45c2dd420561795f7c81a24b14
+        jobs:
+          enabled: false
+          storeDir: null
+          disposeTimeoutMs: 15000
+          presetId: dsh-wiki-worker
+        #
+        # RUN 3 RESULT — COMPLETED (refused by the content gate); config reverted to OFF above.
+        # job 28146407662c404e, 05:27-05:43 (~16 min), phase=failed, journal=aborted, NOTHING PUBLISHED.
+        # protocolSha256 9a169c73... confirmed in the journal record, same commit/config/model as RUN 2,
+        # so the run validly exercised the new protocol rules. It produced 28 pages + 20 cards; specs/ is
+        # finally covered (T035 worked); it was refused for ONE page over the advisory word ceiling
+        # (known-issues, 1185 words vs 1035) plus two uncited pages. RUN 2's 31-page wiki was preserved.
+        # Detail: docs/arch-notes/dsh-wiki-run2-defect-audit-20261110.md section 8.
+        #
+        # 2026-11-10 OWNER-AUTHORIZED RUN 2 — COMPLETED, config reverted to this commented default.
+        # Owner instruction: "uỷ quyền (bật jobs.enabled, 1 job, rồi tắt)". Exactly one job ran.
+        # job 363628a3f78d4b91, DXVK_Project, model r9-fallback/ds41-cmc-ccsonnet, session
+        # dsh-wiki-363628a3f78d4b91, journal phase "published", 31 pages (run 1: 15).
+        # Config came from <repo>/.dsh-wiki/config.json (language en, granularity hybrid,
+        # pages 18-50, wordsPerPage [400,900], diagrams rich, citations strict, knownIssues true),
+        # which publish preserves because it is a PROTECTED_LIVE_ENTRY.
+        #
+        # 2026-11-09 OWNER-AUTHORIZED CONTROLLED TRIAL — COMPLETED, config reverted to the default.
+        # One English canonical wiki was generated for DXVK_Project through the plugin (job
+        # 331389551195469b, source commit dd02d64, model r9-fallback/ds41-cmc-ccsonnet):
+        # 15 pages + 14 cards, 301 citations all resolving, 14 mermaid diagrams, selfcheck PASS.
+        # Runtime confinement behaved as designed (a read outside the job roots was denied by the
+        # worker guard; no shell/network tools were available). Residual risks that are NOT solved
+        # and were accepted only for that single run: the guard is a policy layer, not an OS sandbox;
+        # check-then-act TOCTOU windows remain; context loaders are not confined. Keep this off until
+        # T018–T020 are closed and an independent reviewer signs off.
+        # (2026-11-10: that reviewer pass ran and FAILED T018 and T020 — see
+        # docs/arch-notes/dsh-wiki-t018-t020-review-20261110.md. The gates remain closed.)
+        # 2026-11-09 OWNER-AUTHORIZED CONTROLLED TRIAL — COMPLETED, config reverted to the default.
+        # One English canonical wiki was generated for DXVK_Project through the plugin (job
+        # 331389551195469b, source commit dd02d64, model r9-fallback/ds41-cmc-ccsonnet):
+        # 15 pages + 14 cards, 301 citations all resolving, 14 mermaid diagrams, selfcheck PASS.
+        # Runtime confinement behaved as designed (a read outside the job roots was denied by the
+        # worker guard; no shell/network tools were available). Residual risks that are NOT solved
+        # and were accepted only for that single run: the guard is a policy layer, not an OS sandbox;
+        # check-then-act TOCTOU windows remain; context loaders are not confined. Keep this off until
+        # T018–T020 are closed and an independent reviewer signs off.

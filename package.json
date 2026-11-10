@@ -1,7 +1,7 @@
 {
   "name": "@dsh-ext/dsh-wiki",
   "version": "0.2.0",
-  "description": "纯本地 Repo Wiki（DeepWiki 式）：agent 本地读懂仓库，生成带证据引用的分页 wiki（目录树+图表），构建单文件自包含站点，零上传零网络。",
+  "description": "Local Repo Wiki (DeepWiki-style): the agent reads a repository locally and writes a paged, evidence-cited wiki (page tree + diagrams + knowledge cards), built into a single self-contained site and browsable natively in DSH. Nothing uploaded, zero network.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -21,7 +21,7 @@
     "LICENSE"
   ],
   "engines": {
-    "dsh": ">=0.2.0-rc.1"
+    "dsh": "0.2.2-rc.1"
   },
   "dsh": {
     "bundle": {
@@ -30,8 +30,9 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-ui-slots",
-        "@deepseek-ai/dsh-client-locale"
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
       ]
     }
   },
@@ -40,7 +41,8 @@
     "@deepseek-ai/dsh-commands": "^0.1.1-rc.1 || ^0.2.0-rc.1",
     "@deepseek-ai/dsh-host-webserver": "^0.1.1-rc.1 || ^0.2.0-rc.1",
     "@deepseek-ai/dsh-session": "^0.1.1-rc.1 || ^0.2.0-rc.1",
-    "@deepseek-ai/dsh-skill": "^0.1.1-rc.1 || ^0.2.0-rc.1"
+    "@deepseek-ai/dsh-skill": "^0.1.1-rc.1 || ^0.2.0-rc.1",
+    "@deepseek-ai/schemastery": "~3.19.0"
   },
   "keywords": [
     "dsh-plugin",
@@ -51,8 +53,15 @@
     "local-first",
     "privacy"
   ],
+  "private": true,
   "license": "MIT",
   "author": {
-    "name": "acfufu"
-  }
+    "name": "neste"
+  },
+  "contributors": [
+    {
+      "name": "acfufu",
+      "url": "https://github.com/Acfufu/dsh-wiki"
+    }
+  ]
 }

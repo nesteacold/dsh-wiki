@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
-"""repo-wiki 插件构建器 — 纯本地、零网络、仅标准库（Python ≥3.7）。
+"""dsh-wiki builder — local only, zero network, standard library only (Python >= 3.7).
 
-子命令:
-  build          --wiki <dir>                       由 wiki.json 构建自包含 site/index.html
-  import-legacy  <hash|path> [--dest <dir>]         导入旧版 ~/.zcode/v2/repo-wiki/<hash> 并构建（不自动自检）
-  selfcheck      --wiki <dir>                       树完整性 + 零外链 + 引用机检 (exit 0/1)
-  resolve-config --repo <path> [--set K=V …] [--dry-run]  三层合并生成配置并落 generation-meta.json
+Subcommands:
+  build          --wiki <dir>                       build a self-contained site/index.html from wiki.json
+  import-legacy  <hash|path> [--dest <dir>]         import legacy ~/.zcode/v2/repo-wiki/<hash> and build (no automatic selfcheck)
+  selfcheck      --wiki <dir>                       tree integrity + zero external links + citation check (exit 0/1)
+  resolve-config --repo <path> [--set K=V …] [--dry-run]  merge config layers and write generation-meta.json
   assemble       --wiki <dir> [--repo P] [--title T] [--language L]  pages/*.md + cards/*.md → wiki.json
+  diff-impact    --wiki <dir> [--repo P] [--from C] [--to C]  changed files → affected pages/cards (read-only JSON)
+  check-translation --canonical <dir> (--translation <dir>|--lang <tag>) [--meta <file>] [--json]
+                                                    translated locale snapshot vs canonical English wiki (read-only)
+  locales-init   --canonical <dir> --lang <tag> [--force] [--json]
+                                                    create <canonical>/locales/<tag>/ skeleton (structure only)
 
-约定：WARN/FAIL 诊断走 stderr，数据/报告走 stdout。
+Convention: WARN/FAIL diagnostics go to stderr, data/reports to stdout.
 """
 import argparse
+import copy
 import html
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -33,6 +41,53 @@ _MAX_MD_DEPTH = 16
 _CARD_LINKS = None
 _CARD_LINK_WARNS: list = []
 
+# Site chrome strings follow wiki.json `language`: vi* -> Vietnamese, zh* -> Chinese,
+# anything else -> English (default). Every table must carry exactly the "en" keys.
+UI_STRINGS = {
+    "en": {
+        "image": "image", "imageNote": " (offline viewer does not load external images)",
+        "sources": "Sources", "emptyPage": "(this page has no content)",
+        "kindModule": "Module", "kindConcept": "Concept", "kindApi": "API",
+        "all": "All", "cards": "Knowledge cards",
+        "cardsDesc": "{n} cards: atomic overviews of modules, concepts and APIs, each with machine-checked evidence.",
+        "noSummary": "(no summary)", "keyFiles": "Key files", "related": "Related cards", "refBy": "Pages referencing this card",
+        "cardTag": "card", "theme": "Toggle theme", "search": "Search\u2026",
+        "noscript": "This viewer needs JavaScript to switch pages and search; open it in a browser with JavaScript enabled.",
+        "footer": "generated locally, nothing uploaded", "noHits": "No results", "light": "Light", "dark": "Dark",
+    },
+    "zh": {
+        "image": "图片", "imageNote": "（离线查看器不加载外部图片）",
+        "sources": "来源", "emptyPage": "（此页无内容）",
+        "kindModule": "模块", "kindConcept": "概念", "kindApi": "API",
+        "all": "全部", "cards": "知识卡片",
+        "cardsDesc": "{n} 张卡片：模块、概念与 API 的原子速览，每张都带可机检的证据。",
+        "noSummary": "（无摘要）", "keyFiles": "关键文件", "related": "相关卡片", "refBy": "引用此卡片的页面",
+        "cardTag": "卡片", "theme": "切换主题", "search": "全文搜索…",
+        "noscript": "本查看器需要 JavaScript 才能切换页面与全文搜索；请在启用 JS 的浏览器中打开。",
+        "footer": "纯本地生成，零上传", "noHits": "无命中", "light": "浅色", "dark": "深色",
+    },
+    "vi": {
+        "image": "hình ảnh", "imageNote": " (trình xem ngoại tuyến không tải ảnh bên ngoài)",
+        "sources": "Nguồn", "emptyPage": "(trang này không có nội dung)",
+        "kindModule": "Mô-đun", "kindConcept": "Khái niệm", "kindApi": "API",
+        "all": "Tất cả", "cards": "Thẻ tri thức",
+        "cardsDesc": "{n} thẻ: tổng quan nguyên tử của mô-đun, khái niệm và API, mỗi thẻ đều kèm bằng chứng kiểm tra tự động.",
+        "noSummary": "(không có tóm tắt)", "keyFiles": "Tệp tham chiếu", "related": "Thẻ liên quan",
+        "refBy": "Trang tham chiếu thẻ này",
+        "cardTag": "thẻ", "theme": "Đổi giao diện", "search": "Tìm toàn văn…",
+        "noscript": "Trình xem này cần JavaScript để chuyển trang và tìm kiếm toàn văn; hãy mở trong trình duyệt có bật JavaScript.",
+        "footer": "tạo cục bộ, không tải lên", "noHits": "Không có kết quả", "light": "Sáng", "dark": "Tối",
+    },
+}
+_UI = UI_STRINGS["en"]
+
+
+def ui_lang(lang) -> str:
+    low = str(lang or "").lower()
+    if low.startswith("vi"):
+        return "vi"
+    return "zh" if low.startswith("zh") else "en"
+
 
 def _inline(s: str) -> str:
     s = s.replace("\x00", "")  # NUL 不合法且与 stash 占位符冲突，直接剔除
@@ -46,7 +101,7 @@ def _inline(s: str) -> str:
     s = re.sub(r"`([^`]+)`", _stash, s)
     s = html.escape(s, quote=True)
     s = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)",
-               lambda m: f'<span class="imgref" title="{m.group(2)}">🖼 {m.group(1) or "图片"}（离线查看器不加载外部图片）</span>', s)
+               lambda m: f'<span class="imgref" title="{m.group(2)}">🖼 {m.group(1) or _UI["image"]}{_UI["imageNote"]}</span>', s)
     if _CARD_LINKS is not None:
         # 知识卡片链接 [文本](#card-<id>)：仅当本 wiki 有卡片时才变成站内锚点；
         # 目标不存在则降级为纯文本并告警。id 字符集受限，href 不可能携带外链。
@@ -449,7 +504,7 @@ def normalize_pages(raw_pages, warns=None):
     pages = []
     for idx, p in enumerate(raw_pages):
         if not isinstance(p, dict):
-            warns.append(f"pages[{idx}] 不是对象（{type(p).__name__}），已跳过")
+            warns.append(f"pages[{idx}] is not an object ({type(p).__name__}); skipped")
             continue
         raw_id = p.get("id")
         raw_title = p.get("title")
@@ -459,13 +514,13 @@ def normalize_pages(raw_pages, warns=None):
         mapping.setdefault(raw_key, pid)
         counts[raw_key] += 1
         if raw_id is None and raw_title is not None:
-            warns.append(f"pages[{idx}] 缺 id，按 title {raw_title!r} 生成")
+            warns.append(f"pages[{idx}] has no id; derived from title {raw_title!r}")
         title = raw_title if isinstance(raw_title, str) else (str(raw_title) if raw_title is not None else "")
         title = _clean_text(title)
         if not title.strip():
             if raw_title is not None:
-                warns.append(f"页面 {pid} 的 title 为空或纯空白，已置为『无标题』")
-            title = "无标题"
+                warns.append(f"page {pid} has an empty title; set to 'Untitled'")
+            title = "Untitled"
         desc = p.get("description") or ""
         md = p.get("markdown") or ""
         pages.append({
@@ -480,7 +535,7 @@ def normalize_pages(raw_pages, warns=None):
         })
     for raw_key, n in counts.items():
         if n > 1:
-            warns.append(f"页面 id 重复 {raw_key!r} ×{n}，已自动去重")
+            warns.append(f"duplicate page id {raw_key!r} x{n}; de-duplicated")
     # parentId 与 id 走同一套清洗/去重映射，避免 CJK/数字/重名 id 断链
     for q in pages:
         if q["parentId"] is not None:
@@ -519,9 +574,9 @@ def _page_section(p) -> str:
         f'<span class="chip src">{html.escape(str(s.get("path", "?")))}'
         f'{":" + html.escape(str(s["startLine"])) if s.get("startLine") else ""}</span>'
         for s in p["sources"][:20])
-    src_html = f'<div class="chips"><span class="srclab">来源</span>{srcs}</div>' if srcs else ""
+    src_html = f'<div class="chips"><span class="srclab">{_UI["sources"]}</span>{srcs}</div>' if srcs else ""
     desc = f'<p class="desc">{_inline(p["description"])}</p>' if p["description"] else ""
-    body = md_to_html(p["markdown"]) if p["markdown"] else '<p class="todo">（此页无内容）</p>'
+    body = md_to_html(p["markdown"]) if p["markdown"] else f'<p class="todo">{_UI["emptyPage"]}</p>'
     return (f'<section class="page" id="pg-{p["id"]}" hidden>'
             f'<h1>{html.escape(str(p["title"]))}</h1>{desc}{chip_html}{src_html}'
             f'<div class="content">{body}</div></section>')
@@ -532,7 +587,8 @@ def _page_section(p) -> str:
 # markdown/SVG 渲染路径；无卡片时站点输出与旧版逐字节一致（时间戳除外）。
 
 CARD_KINDS = ("module", "concept", "api")
-CARD_KIND_LABEL = {"module": "模块", "concept": "概念", "api": "API"}
+def _kind_label(kind):
+    return _UI.get({"module": "kindModule", "concept": "kindConcept", "api": "kindApi"}.get(kind, "kindConcept"))
 _CARD_SUMMARY_MAX = 400
 _CARD_KEYFILES_MAX = 8
 _CARD_WARN_COUNT = 200
@@ -545,43 +601,43 @@ def normalize_cards(raw_cards, page_ids, warns=None):
     if raw_cards is None:
         return []
     if not isinstance(raw_cards, list):
-        warns.append(f"cards 不是数组（{type(raw_cards).__name__}），已忽略全部卡片")
+        warns.append(f"cards is not an array ({type(raw_cards).__name__}); all cards ignored")
         return []
     used = set()
     page_ids = set(page_ids)
     cards = []
     for idx, c in enumerate(raw_cards):
         if not isinstance(c, dict):
-            warns.append(f"cards[{idx}] 不是对象（{type(c).__name__}），已跳过")
+            warns.append(f"cards[{idx}] is not an object ({type(c).__name__}); skipped")
             continue
         raw_id = c.get("id") if c.get("id") is not None else c.get("title")
         if raw_id is None or not str(raw_id).strip():
-            warns.append(f"cards[{idx}] 缺 id 与 title，已跳过")
+            warns.append(f"cards[{idx}] has neither id nor title; skipped")
             continue
         raw_id = str(raw_id)
         if raw_id == "grid":
             raw_id = "grid-card"
-            warns.append(f"cards[{idx}] id 'grid' 为保留字，已改为 grid-card")
+            warns.append(f"cards[{idx}] id 'grid' is reserved; renamed to grid-card")
         before = set(used)
         cid = _safe_id(raw_id, used)
         # 冲突检查必须在清洗/去重之后：去重后缀（如 x-2）也可能撞上页面 id card-x-2
         if f"card-{cid}" in page_ids or cid == "grid":
-            warns.append(f"卡片 {raw_id} 的锚点 card-{cid} 与页面 id 或保留锚点冲突，已跳过")
+            warns.append(f"card {raw_id}: anchor card-{cid} collides with a page id or reserved anchor; skipped")
             used.discard(cid)
             continue
         if cid != re.sub(r"[^A-Za-z0-9_-]", "-", raw_id) or raw_id in before:
-            warns.append(f"卡片 id {raw_id!r} 已清洗/去重为 {cid}")
+            warns.append(f"card id {raw_id!r} sanitized/de-duplicated to {cid}")
         title = _clean_text(str(c.get("title") or cid)).strip() or cid
         kind = c.get("kind")
         if kind not in CARD_KINDS:
             if kind is not None:
-                warns.append(f"卡片 {cid} 的 kind {kind!r} 非法，已置为 concept")
+                warns.append(f"card {cid}: invalid kind {kind!r}; set to concept")
             kind = "concept"
         summary = c.get("summary")
         summary = _clean_text(summary if isinstance(summary, str) else ("" if summary is None else str(summary)))
         summary = " ".join(summary.split())
         if len(summary) > _CARD_SUMMARY_MAX:
-            warns.append(f"卡片 {cid} 的 summary 超过 {_CARD_SUMMARY_MAX} 字符，已截断")
+            warns.append(f"card {cid}: summary longer than {_CARD_SUMMARY_MAX} chars; truncated")
             summary = summary[:_CARD_SUMMARY_MAX - 1] + "…"
         key_files = []
         for kf in _as_str_list(c.get("keyFiles")):
@@ -591,12 +647,12 @@ def normalize_cards(raw_cards, page_ids, warns=None):
                     and ".." not in path_part.split("/"):
                 key_files.append(kf)
             else:
-                warns.append(f"卡片 {cid} 的 keyFiles 条目 {kf!r} 非法（需 仓库相对路径[:行号]），已丢弃")
+                warns.append(f"card {cid}: invalid keyFiles entry {kf!r} (need repo-relative path[:line]); dropped")
         if len(key_files) > _CARD_KEYFILES_MAX:
-            warns.append(f"卡片 {cid} 的 keyFiles 超过 {_CARD_KEYFILES_MAX} 个，已截断")
+            warns.append(f"card {cid}: more than {_CARD_KEYFILES_MAX} keyFiles; truncated")
             key_files = key_files[:_CARD_KEYFILES_MAX]
         if not key_files:
-            warns.append(f"卡片 {cid} 没有合法 keyFiles（至少 1 个证据），已跳过")
+            warns.append(f"card {cid} has no valid keyFiles (at least 1 piece of evidence required); skipped")
             used.discard(cid)
             continue
         cards.append({
@@ -610,14 +666,14 @@ def normalize_cards(raw_cards, page_ids, warns=None):
     for c in cards:
         bad = [r for r in c["related"] if r not in ids or r == c["id"]]
         if bad:
-            warns.append(f"卡片 {c['id']} 的 related 指向不存在的卡片 {', '.join(bad[:5])}，已移除")
+            warns.append(f"card {c['id']}: related points to missing cards {', '.join(bad[:5])}; removed")
         c["related"] = [r for r in dict.fromkeys(c["related"]) if r in ids and r != c["id"]]
         badp = [p for p in c["pageIds"] if p not in page_ids]
         if badp:
-            warns.append(f"卡片 {c['id']} 的 pageIds 指向不存在的页面 {', '.join(badp[:5])}，已移除")
+            warns.append(f"card {c['id']}: pageIds point to missing pages {', '.join(badp[:5])}; removed")
         c["pageIds"] = [p for p in dict.fromkeys(c["pageIds"]) if p in page_ids]
     if len(cards) > _CARD_WARN_COUNT:
-        warns.append(f"卡片数 {len(cards)} 超过 {_CARD_WARN_COUNT}（建议 10–40），站点可能变大变慢")
+        warns.append(f"{len(cards)} cards exceed {_CARD_WARN_COUNT} (10-40 recommended); the site may get large and slow")
     return cards
 
 
@@ -635,7 +691,7 @@ def _card_tile(c) -> str:
     tags = "".join(f'<span class="ctag">{html.escape(t)}</span>' for t in c["tags"])
     return (f'<a class="ctile" href="#card-{c["id"]}" data-kind="{c["kind"]}" '
             f'data-tags="{html.escape(" ".join(c["tags"]), quote=True)}">'
-            f'<span class="ckind k-{c["kind"]}">{CARD_KIND_LABEL[c["kind"]]}</span>'
+            f'<span class="ckind k-{c["kind"]}">{_kind_label(c["kind"])}</span>'
             f'<b>{html.escape(c["title"])}</b><span class="csum">{html.escape(c["summary"])}</span>'
             f'<span class="ctags">{tags}</span></a>')
 
@@ -646,12 +702,12 @@ def _cards_html(cards, pages) -> str:
     refs = _card_pages_linking(cards, pages)
     tags = sorted({t for c in cards for t in c["tags"]}, key=str.casefold)
     kinds = [k for k in CARD_KINDS if any(c["kind"] == k for c in cards)]
-    btns = ['<button class="cfilt on" data-f="">全部</button>']
-    btns += [f'<button class="cfilt" data-f="k:{k}">{CARD_KIND_LABEL[k]}</button>' for k in kinds]
+    btns = [f'<button class="cfilt on" data-f="">{_UI["all"]}</button>']
+    btns += [f'<button class="cfilt" data-f="k:{k}">{_kind_label(k)}</button>' for k in kinds]
     btns += [f'<button class="cfilt" data-f="t:{html.escape(t, quote=True)}">#{html.escape(t)}</button>'
              for t in tags[:40]]
-    grid = (f'<section class="page" id="pg-card-grid" hidden><h1>知识卡片</h1>'
-            f'<p class="desc">{len(cards)} 张卡片：模块、概念与 API 的原子速览，每张都带可机检的证据。</p>'
+    grid = (f'<section class="page" id="pg-card-grid" hidden><h1>{_UI["cards"]}</h1>'
+            f'<p class="desc">{html.escape(_UI["cardsDesc"].format(n=len(cards)))}</p>'
             f'<div class="cfilters">{"".join(btns)}</div>'
             f'<div class="cgrid">{"".join(_card_tile(c) for c in cards)}</div></section>')
     out = [grid]
@@ -664,16 +720,16 @@ def _cards_html(cards, pages) -> str:
                      for pid in refs[c["id"]] if pid in by_page)
         tags_html = "".join(f'<span class="ctag">{html.escape(t)}</span>' for t in c["tags"])
         parts = [f'<section class="page card" id="pg-card-{c["id"]}" hidden>',
-                 f'<p class="crumb"><a href="#card-grid">知识卡片</a> · '
-                 f'<span class="ckind k-{c["kind"]}">{CARD_KIND_LABEL[c["kind"]]}</span></p>',
+                 f'<p class="crumb"><a href="#card-grid">{_UI["cards"]}</a> · '
+                 f'<span class="ckind k-{c["kind"]}">{_kind_label(c["kind"])}</span></p>',
                  f'<h1>{html.escape(c["title"])}</h1>',
-                 f'<p class="csummary">{html.escape(c["summary"]) or "（无摘要）"}</p>',
+                 f'<p class="csummary">{html.escape(c["summary"]) or _UI["noSummary"]}</p>',
                  f'<div class="ctags">{tags_html}</div>' if tags_html else "",
-                 f'<h3>关键文件</h3><ul class="cfiles">{files}</ul>']
+                 f'<h3>{_UI["keyFiles"]}</h3><ul class="cfiles">{files}</ul>']
         if rel:
-            parts.append(f'<h3>相关卡片</h3><ul>{rel}</ul>')
+            parts.append(f'<h3>{_UI["related"]}</h3><ul>{rel}</ul>')
         if pg:
-            parts.append(f'<h3>引用此卡片的页面</h3><ul>{pg}</ul>')
+            parts.append(f'<h3>{_UI["refBy"]}</h3><ul>{pg}</ul>')
         parts.append("</section>")
         out.append("".join(parts))
     return "\n".join(out)
@@ -715,13 +771,23 @@ _TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__</title>
 <style>
-:root{--bg:#fafaf8;--fg:#1f2328;--muted:#59636e;--panel:#ffffff;--border:#d1d9e0;--accent:#0969da;--codebg:#f2f4f7;--chipbg:#eceff3;--shadow:rgba(0,0,0,.06)}
-[data-theme=dark]{--bg:#0d1117;--fg:#e6edf3;--muted:#8b949e;--panel:#161b22;--border:#30363d;--accent:#4493f8;--codebg:#10151c;--chipbg:#1d242d;--shadow:rgba(0,0,0,.4)}
+:root{color-scheme:light;--bg:#fafaf8;--fg:#1f2328;--muted:#59636e;--panel:#ffffff;--border:#d1d9e0;--accent:#0969da;--codebg:#f2f4f7;--chipbg:#eceff3;--shadow:rgba(0,0,0,.06)}
+/* 深色规则用 html[data-theme="dark"]（比 :root 高一档特异度），不靠"后写的同特异度规则"取胜；
+   并额外写死一份背景/前景兜底，即使某个自定义属性丢失，点击切换也一定看得见。 */
+html[data-theme="dark"]{color-scheme:dark;--bg:#0d1117;--fg:#e6edf3;--muted:#8b949e;--panel:#161b22;--border:#30363d;--accent:#4493f8;--codebg:#10151c;--chipbg:#1d242d;--shadow:rgba(0,0,0,.4)}
+html[data-theme="dark"],html[data-theme="dark"] body{background:#0d1117;color:#e6edf3}
 *{box-sizing:border-box}html,body{margin:0;height:100%}
 body{display:flex;background:var(--bg);color:var(--fg);font:15px/1.75 -apple-system,"PingFang SC","Segoe UI",Roboto,sans-serif}
 aside{width:300px;min-width:300px;height:100vh;overflow:auto;background:var(--panel);border-right:1px solid var(--border);padding:16px 14px 32px}
-#tbtn{float:right;background:none;border:1px solid var(--border);border-radius:6px;color:var(--fg);cursor:pointer;font-size:12px;padding:2px 8px}
-#repo{font-weight:700;font-size:15px;margin:2px 44px 10px 0;word-break:break-all}
+/* 主题开关：浮在右上角、位于窗口标题栏（caption 按钮）下方 44px，大点击区、高对比、no-drag。
+   旧实现是贴在最上沿的 12px 小按钮，正好落在桌面窗口的可拖拽标题区里，点击会被窗口吞掉。 */
+#tbtn{position:fixed;top:44px;right:16px;z-index:2147483000;display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  min-height:38px;padding:0 16px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--fg);
+  cursor:pointer;font:600 13px/1.2 -apple-system,"PingFang SC","Segoe UI",Roboto,sans-serif;
+  box-shadow:0 2px 10px var(--shadow);-webkit-app-region:no-drag}
+#tbtn:hover{border-color:var(--accent);color:var(--accent)}
+#tbtn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#repo{font-weight:700;font-size:15px;margin:0 0 10px;word-break:break-all}
 #search{width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font-size:13px;margin-bottom:8px}
 #hits{border:1px solid var(--border);border-radius:8px;margin-bottom:8px;max-height:45vh;overflow:auto;background:var(--bg)}
 .hit{padding:6px 10px;border-bottom:1px solid var(--border);cursor:pointer;font-size:12.5px}
@@ -755,21 +821,44 @@ th{background:var(--chipbg)}
 hr{border:0;border-top:1px solid var(--border);margin:22px 0}
 footer{margin-top:60px;color:var(--muted);font-size:12px}
 @media (prefers-reduced-motion:no-preference){.navitem,.chip{transition:background .15s}}
-@media (max-width:760px){body{flex-direction:column}aside{width:100%;min-width:0;height:auto;max-height:38vh;border-right:0;border-bottom:1px solid var(--border)}main{height:auto;max-width:none;padding:20px 16px 64px}}
+@media (max-width:760px){body{flex-direction:column}aside{width:100%;min-width:0;height:auto;max-height:38vh;border-right:0;border-bottom:1px solid var(--border)}main{height:auto;max-width:none;padding:20px 16px 64px}#tbtn{top:auto;bottom:12px;right:12px}}
 __CARDCSS__</style>
+<script id="rw-theme">
+/* 主题在首帧之前应用：只依赖 documentElement / localStorage，不依赖下面那个 3MB 的查看器脚本。
+   点击切换后写 localStorage('rw-theme')，并把 data-theme 同时放到 html 与 body 元素上；
+   关掉本地存储时仍能切换（读失败就跟随系统偏好）。 */
+(function(){
+var KEY='rw-theme',LIGHT=__LLIGHT__,DARK=__LDARK__;
+function norm(v){return v==='dark'?'dark':'light';}
+function read(){try{var v=localStorage.getItem(KEY);if(v==='dark'||v==='light')return v;}catch(e){}
+try{return matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';}catch(e){return 'light';}}
+function paint(v){var t=norm(v),h=document.documentElement;h.setAttribute('data-theme',t);
+try{h.dataset.theme=t;}catch(e){}
+try{if(document.body)document.body.setAttribute('data-theme',t);}catch(e){}
+return t;}
+function paintLabel(v){var b=document.getElementById('tbtn');if(!b)return;var dark=norm(v)==='dark';
+b.textContent=dark?'☀️ '+LIGHT:'🌙 '+DARK;b.setAttribute('aria-pressed',dark?'true':'false');}
+function apply(v,persist){var t=paint(v);if(persist!==false){try{localStorage.setItem(KEY,t);}catch(e){}}
+paintLabel(t);try{if(typeof window.__rwAfterTheme==='function')window.__rwAfterTheme(t);}catch(e){}return t;}
+function toggle(){return apply(document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark');}
+window.__rwTheme={apply:apply,toggle:toggle,read:read,paint:paint,KEY:KEY};
+var boot=paint(read());
+document.addEventListener('DOMContentLoaded',function(){apply(boot,false);});
+})();
+</script>
 </head>
 <body>
+<button id="tbtn" type="button" title="__LTHEME__" aria-pressed="false" onclick="window.__rwTheme&amp;&amp;window.__rwTheme.toggle()">__LTHEMELABEL__</button>
 <aside>
-  <button id="tbtn" title="切换主题">🌓</button>
   <div id="repo">__REPO__</div>
-  <input id="search" type="search" placeholder="全文搜索…" autocomplete="off">
+  <input id="search" type="search" placeholder="__LSEARCH__" autocomplete="off">
   <div id="hits" hidden role="listbox"></div>
   <nav id="tree">__TREE__</nav>__CARDNAV__
 </aside>
 <main id="main">
-<noscript><p class="todo">本查看器需要 JavaScript 才能切换页面与全文搜索；请在启用 JS 的浏览器中打开。</p></noscript>
+<noscript><p class="todo">__LNOSCRIPT__</p></noscript>
 __PAGES____CARDS__
-<footer>dsh-wiki@local · 纯本地生成，零上传 · __DATE__</footer>
+<footer>dsh-wiki@local · __LFOOTER__ · __DATE__</footer>
 </main>
 <script>__MERMAID__</script>
 <script>
@@ -810,7 +899,7 @@ search.addEventListener('input',function(){
     out.push({id:id,t:it.title,s:it.text.substr(tpos>=0?Math.max(0,tpos-30):0,90)});
     if(out.length>=30)break;}
   hits.innerHTML='';
-  if(!out.length){var none=document.createElement('div');none.className='hit none';none.textContent='无命中';hits.appendChild(none);}
+  if(!out.length){var none=document.createElement('div');none.className='hit none';none.textContent=__LNOHITS__;hits.appendChild(none);}
   else{out.forEach(function(h){
     var d=document.createElement('div');d.className='hit';d.setAttribute('data-page',h.id);
     d.tabIndex=0;d.setAttribute('role','option');
@@ -843,21 +932,11 @@ function renderMermaids(){
     return false;
   }
 }
-function applyTheme(t){
-  t=(t==='dark')?'dark':'light';
-  document.documentElement.dataset.theme=t;
-  try{localStorage.setItem('rw-theme',t);}catch(e){}
-  document.getElementById('tbtn').textContent=t==='dark'?'☀️ 浅色':'🌙 深色';
-  renderMermaids();
-}
-document.getElementById('tbtn').onclick=function(){
-  applyTheme(document.documentElement.dataset.theme==='dark'?'light':'dark');};
-var saved='light';
-try{saved=localStorage.getItem('rw-theme')||'';}catch(e){}
-if(saved!=='dark'&&saved!=='light'){
-  try{saved=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';}catch(e){saved='light';}
-}
-applyTheme(saved);
+/* 主题由 head 里的 rw-theme 脚本负责（首帧前应用、点击即可用、localStorage 持久化）：
+   这里只接管"切换后重渲染图表"，并把点击绑定到同一份实现，避免两套状态互相打脸。 */
+window.__rwAfterTheme=function(){renderMermaids();};
+(function(){var btn=document.getElementById('tbtn'),T=window.__rwTheme;
+if(btn&&T){btn.onclick=function(){T.toggle();};}})();
 var initial=location.hash.slice(1);
 show(initial);
 __CARDJS__})();
@@ -867,13 +946,17 @@ __CARDJS__})();
 """
 
 
+def _js_str(s: str) -> str:
+    return json.dumps(s, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+
+
 def _mermaid_runtime() -> str:
     if MERMAID_PATH.exists():
         try:
             js = MERMAID_PATH.read_text(encoding="utf-8", errors="surrogatepass")
         except (UnicodeDecodeError, OSError) as exc:
-            print(f"[dsh-wiki] WARN mermaid 资产不可读（{exc}），图表仅显源码", file=sys.stderr)
-            return "window.mermaid=null;console.warn('mermaid.min.js 未内联，图表仅显源码');"
+            print(f"[dsh-wiki] WARN mermaid asset unreadable ({exc}); diagrams will show source only", file=sys.stderr)
+            return "window.mermaid=null;console.warn('mermaid.min.js not inlined; diagrams show source only');"
         # 大小写不敏感地打断脚本结束标记与注释起始（HTML 解析对 </script 大小写不敏感）
         js = re.sub(r"(?i)</script", "<\\/script", js)
         js = re.sub(r"(?i)<!--", "<\\!--", js)
@@ -890,10 +973,10 @@ def _mermaid_runtime() -> str:
                     lambda m: "\\u003c" + m.group(1), js)
         adapter = ("var __rwNs=window.__esbuild_esm_mermaid_nm;"
                    "window.mermaid=(__rwNs&&__rwNs.mermaid)&&(__rwNs.mermaid.default||__rwNs.mermaid);"
-                   "if(!window.mermaid)console.warn('dsh-wiki: mermaid 挂载失败,图表仅显源码');")
+                   "if(!window.mermaid)console.warn('dsh-wiki: mermaid failed to mount; diagrams show source only');")
         return js + "\n" + adapter
-    print("[dsh-wiki] WARN 未找到 assets/mermaid.min.js，图表仅显源码", file=sys.stderr)
-    return "window.mermaid=null;console.warn('mermaid.min.js 未内联，图表仅显源码');"
+    print("[dsh-wiki] WARN assets/mermaid.min.js not found; diagrams will show source only", file=sys.stderr)
+    return "window.mermaid=null;console.warn('mermaid.min.js not inlined; diagrams show source only');"
 
 
 def _write_text(path: Path, text: str) -> None:
@@ -921,43 +1004,44 @@ def _write_text(path: Path, text: str) -> None:
             tmp.unlink()
         except OSError:
             pass
-        sys.exit(f"[dsh-wiki] 无法写入 {target}：{exc}")
+        sys.exit(f"[dsh-wiki] cannot write {target}: {exc}")
 
 
 def _read_json(path: Path, label: str):
     """读取并解析 JSON，失败时给出干净错误（stderr + exit 1），不裸 traceback。"""
     if path.is_dir():
-        sys.exit(f"[dsh-wiki] {label} 是一个目录，不是文件: {path}")
+        sys.exit(f"[dsh-wiki] {label} is a directory, not a file: {path}")
     if not path.is_file():
-        sys.exit(f"[dsh-wiki] {label} 不存在: {path}")
+        sys.exit(f"[dsh-wiki] {label} does not exist: {path}")
     try:
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
-        sys.exit(f"[dsh-wiki] {label} 不是 UTF-8 文本: {path}（{exc}）")
+        sys.exit(f"[dsh-wiki] {label} is not UTF-8 text: {path} ({exc})")
     except OSError as exc:
-        sys.exit(f"[dsh-wiki] {label} 不可读: {path}（{exc}）")
+        sys.exit(f"[dsh-wiki] {label} is not readable: {path} ({exc})")
     try:
         return json.loads(text)
     except RecursionError:
-        sys.exit(f"[dsh-wiki] {label} JSON 嵌套过深，无法解析: {path}")
+        sys.exit(f"[dsh-wiki] {label}: JSON nested too deeply to parse: {path}")
     except json.JSONDecodeError as exc:
-        sys.exit(f"[dsh-wiki] {label} 不是合法 JSON: {path}（{exc}）")
+        sys.exit(f"[dsh-wiki] {label} is not valid JSON: {path} ({exc})")
 
 
 def build_site(wiki_dir: Path) -> dict:
     wiki_json = wiki_dir / "wiki.json"
     data = _read_json(wiki_json, "wiki.json")
     if not isinstance(data, dict):
-        sys.exit(f"[dsh-wiki] {wiki_json} 顶层必须是 JSON 对象")
+        sys.exit(f"[dsh-wiki] {wiki_json}: top level must be a JSON object")
     warns: list = []
     pages = normalize_pages(data.get("pages") or [], warns)
     if not pages:
         for w in warns:
             print(f"[dsh-wiki] WARN {w}", file=sys.stderr)
-        extra = f"（{len(warns)} 个页面元素非法或缺失，详见 WARN）" if warns else ""
-        sys.exit(f"[dsh-wiki] {wiki_json} 中没有页面{extra}")
+        extra = f" ({len(warns)} page entries invalid or missing; see WARN)" if warns else ""
+        sys.exit(f"[dsh-wiki] {wiki_json} contains no pages{extra}")
     cards = normalize_cards(data.get("cards"), [p["id"] for p in pages], warns)
-    global _CARD_LINKS
+    global _CARD_LINKS, _UI
+    _UI = UI_STRINGS[ui_lang(data.get("language"))]
     _CARD_LINKS = {c["id"] for c in cards} if cards else None
     _CARD_LINK_WARNS.clear()
     try:
@@ -965,6 +1049,7 @@ def build_site(wiki_dir: Path) -> dict:
     finally:
         # 卡片上下文是模块级状态：无论成功或 sys.exit 都要复位，避免泄漏到下一次构建
         _CARD_LINKS = None
+        _UI = UI_STRINGS["en"]
 
 
 def _build_site_render(wiki_dir: Path, data: dict, pages, cards, warns) -> dict:
@@ -982,7 +1067,7 @@ def _build_site_render(wiki_dir: Path, data: dict, pages, cards, warns) -> dict:
         stack.extend(children.get(node["id"], []))
     unreachable = [p["id"] for p in pages if p["id"] not in reachable]
     if unreachable:
-        print(f"[dsh-wiki] WARN {len(unreachable)} 个页面父链成环不可达，导航不显示: "
+        print(f"[dsh-wiki] WARN {len(unreachable)} pages unreachable (parent cycle), hidden from navigation: "
               f"{', '.join(unreachable[:10])}", file=sys.stderr)
     for p in pages:
         sections.append(_page_section(p))
@@ -994,20 +1079,20 @@ def _build_site_render(wiki_dir: Path, data: dict, pages, cards, warns) -> dict:
     for c in cards:
         # 卡片与页面同处一个 INDEX；键带 card- 前缀，与页面 id 命名空间分开
         index[f"card-{c['id']}"] = {
-            "title": f"[{CARD_KIND_LABEL[c['kind']]}卡片] {c['title']}",
+            "title": f"[{_kind_label(c['kind'])} {_UI['cardTag']}] {c['title']}",
             "desc": c["summary"],
             "text": " ".join([c["summary"], " ".join(c["tags"]), " ".join(c["keyFiles"])]),
         }
     if _CARD_LINK_WARNS:
         missing = sorted(set(_CARD_LINK_WARNS))
-        print(f"[dsh-wiki] WARN {len(missing)} 个卡片链接目标不存在，按纯文本渲染: "
+        print(f"[dsh-wiki] WARN {len(missing)} card link targets missing; rendered as plain text: "
               f"{', '.join(missing[:10])}", file=sys.stderr)
     # 品牌位显示名：可选 title 优先，其次 repoId（历史行为），最后落目录名。
     # repoId 仍是引用机检的仓库根，两者互不影响。
     title = _clean_text(str(data.get("title") or data.get("repoId") or wiki_dir.name))
-    lang = str(data.get("language") or "zh-CN")
+    lang = str(data.get("language") or "en")
     if not _LANG_RE.match(lang):
-        lang = "zh-CN"
+        lang = "en"
     page_html = "\n".join(sections)
     # INDEX 以 JSON 字符串嵌入并由 JSON.parse 解析：既规避 </script> 上下文风险，
     # 也避免 {{"__proto__": …}} 对象字面量的原型语义（幽灵页）
@@ -1024,22 +1109,32 @@ def _build_site_render(wiki_dir: Path, data: dict, pages, cards, warns) -> dict:
         "__MERMAID__": _mermaid_runtime(),
         "__INDEX__": idx_literal,
         "__PAGES__": page_html,
+        "__LTHEME__": html.escape(_UI["theme"], quote=True),
+        # 主题按钮初始文案（浅色下显示"🌙 Dark"，与脚本首帧后的取值一致）
+        "__LTHEMELABEL__": html.escape("🌙 " + _UI["dark"]),
+        "__LSEARCH__": html.escape(_UI["search"], quote=True),
+        "__LNOSCRIPT__": html.escape(_UI["noscript"]),
+        "__LFOOTER__": html.escape(_UI["footer"]),
+        # JS string literals: JSON-encoded with < > & escaped (inside <script>)
+        "__LNOHITS__": _js_str(_UI["noHits"]),
+        "__LLIGHT__": _js_str(_UI["light"]),
+        "__LDARK__": _js_str(_UI["dark"]),
         # 无卡片时一律展开为空串：旧 wiki 的输出与 0.1.x 逐字节一致（时间戳除外）
         "__CARDS__": ("\n" + _cards_html(cards, pages)) if cards else "",
         "__CARDNAV__": (f'<ul><li><a class="navitem navcards" data-page="card-grid" href="#card-grid">'
-                        f'🗂 知识卡片（{len(cards)}）</a></li></ul>') if cards else "",
+                        f'🗂 {html.escape(_UI["cards"])} ({len(cards)})</a></li></ul>') if cards else "",
         "__CARDCSS__": _CARD_CSS.lstrip("\n") if cards else "",
         "__CARDJS__": _CARD_JS.lstrip("\n") if cards else "",
     }
     doc = re.sub(r"__[A-Z]+__", lambda m: mapping.get(m.group(0), m.group(0)), _TEMPLATE)
     unresolved = sorted(set(re.findall(r"__[A-Z]+__", _TEMPLATE)) - set(mapping))
     if unresolved:
-        sys.exit(f"[dsh-wiki] 内部错误: 模板占位符缺少映射 {unresolved}（构建器 bug，请报告）")
+        sys.exit(f"[dsh-wiki] internal error: template placeholders without mapping {unresolved} (builder bug, please report)")
     site = wiki_dir / "site"
     try:
         site.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        sys.exit(f"[dsh-wiki] 无法创建站点目录 {site}：{exc}")
+        sys.exit(f"[dsh-wiki] cannot create site directory {site}: {exc}")
     out = site / "index.html"
     _write_text(out, doc)
     return {"pages": len(pages), "cards": len(cards), "path": out.resolve(), "bytes": out.stat().st_size,
@@ -1081,21 +1176,21 @@ _NESTED_KEYS = {"pages": {"min", "max"}, "tree": {"maxChildren", "maxDepth"},
 
 def _apply_layer(resolved, prov, layer_name, cfg, errors):
     if not isinstance(cfg, dict):
-        errors.append(f"{layer_name} 配置必须是 JSON 对象")
+        errors.append(f"{layer_name} config must be a JSON object")
         return None
     profile_present = "profile" in cfg
     profile = cfg.get("profile")
     if profile_present:
         if not isinstance(profile, str) or profile not in PROFILES:
-            errors.append(f"{layer_name}: 未知 profile {profile!r}（可选: {'/'.join(PROFILES)}）")
+            errors.append(f"{layer_name}: unknown profile {profile!r} (choices: {'/'.join(PROFILES)})")
         else:
             _apply_layer(resolved, prov, f"{layer_name}:profile", PROFILES[profile], errors)
     for key, val in cfg.items():
         if key == "profile":
             continue
         if key not in _KNOWN_KEYS:
-            errors.append(f"{layer_name}: 未知配置键 '{key}'"
-                          f"（可调键: {', '.join(sorted(_KNOWN_KEYS | {'profile'}))}）")
+            errors.append(f"{layer_name}: unknown config key '{key}'"
+                          f" (known keys: {', '.join(sorted(_KNOWN_KEYS | {'profile'}))})")
             continue
         if key in _NESTED and isinstance(resolved.get(key), dict) and isinstance(val, dict):
             resolved[key] = {**resolved[key], **val}
@@ -1115,53 +1210,53 @@ def _is_int(x) -> bool:
 def _validate(resolved, errors, warns):
     lang = resolved.get("language")
     if lang != "auto" and not (isinstance(lang, str) and _LANG_RE.match(lang)):
-        errors.append(f"language 非法: {lang!r}（用 'auto' 或 BCP47 代码如 zh-CN/en）")
+        errors.append(f"invalid language: {lang!r} (use 'auto' or a BCP47 code such as en/zh-CN)")
     if resolved.get("granularity") not in ("theme", "file", "hybrid"):
-        errors.append(f"granularity 非法: {resolved.get('granularity')!r}")
+        errors.append(f"invalid granularity: {resolved.get('granularity')!r}")
     if resolved.get("diagrams") not in ("none", "minimal", "rich"):
-        errors.append(f"diagrams 非法: {resolved.get('diagrams')!r}")
+        errors.append(f"invalid diagrams: {resolved.get('diagrams')!r}")
     if resolved.get("citations") not in ("relaxed", "strict"):
-        errors.append(f"citations 非法: {resolved.get('citations')!r}")
+        errors.append(f"invalid citations: {resolved.get('citations')!r}")
     pages = resolved.get("pages")
     if not isinstance(pages, dict):
-        errors.append(f"pages 必须是对象: {pages!r}")
+        errors.append(f"pages must be an object: {pages!r}")
         pages = {}
     elif not (_is_int(pages.get("min")) and _is_int(pages.get("max"))
               and 1 <= pages["min"] <= pages["max"] <= 100):
-        errors.append(f"pages 非法: {pages}（需 1 ≤ min ≤ max ≤ 100 的整数）")
+        errors.append(f"invalid pages: {pages} (need integers 1 <= min <= max <= 100)")
     tree = resolved.get("tree")
     if not isinstance(tree, dict):
-        errors.append(f"tree 必须是对象: {tree!r}")
+        errors.append(f"tree must be an object: {tree!r}")
         tree = {}
     else:
         if not (_is_int(tree.get("maxChildren")) and 2 <= tree["maxChildren"] <= 16):
-            errors.append(f"tree.maxChildren 非法: {tree.get('maxChildren')!r}（2–16 的整数）")
+            errors.append(f"invalid tree.maxChildren: {tree.get('maxChildren')!r} (integer 2-16)")
         if not (_is_int(tree.get("maxDepth")) and 2 <= tree["maxDepth"] <= 6):
-            errors.append(f"tree.maxDepth 非法: {tree.get('maxDepth')!r}（2–6 的整数）")
+            errors.append(f"invalid tree.maxDepth: {tree.get('maxDepth')!r} (integer 2-6)")
     wpp = resolved.get("wordsPerPage")
     if not (isinstance(wpp, list) and len(wpp) == 2
             and all(_is_int(n) and 100 <= n <= 5000 for n in wpp) and wpp[0] <= wpp[1]):
-        errors.append(f"wordsPerPage 非法: {wpp!r}（[min, max]，100–5000 的整数）")
+        errors.append(f"invalid wordsPerPage: {wpp!r} ([min, max], integers 100-5000)")
     skeleton = resolved.get("skeleton")
     if not isinstance(skeleton, dict):
-        errors.append(f"skeleton 必须是对象: {skeleton!r}")
+        errors.append(f"skeleton must be an object: {skeleton!r}")
     elif not isinstance(skeleton.get("knownIssues"), bool):
-        errors.append("skeleton.knownIssues 必须是布尔值")
+        errors.append("skeleton.knownIssues must be a boolean")
     for group, allowed in _NESTED_KEYS.items():
         val = resolved.get(group)
         if isinstance(val, dict):
             extra = sorted(set(val) - allowed)
             if extra:
-                errors.append(f"{group} 含未知子键: {', '.join(extra)}"
-                              f"（可调: {', '.join(sorted(allowed))}）")
+                errors.append(f"{group} has unknown sub-keys: {', '.join(extra)}"
+                              f" (allowed: {', '.join(sorted(allowed))})")
     if resolved.get("granularity") == "file" and _is_int(pages.get("max")) and pages["max"] < 20:
-        warns.append("granularity=file 但 pages.max<20：逐文件切分通常需要更多页，建议调高")
+        warns.append("granularity=file but pages.max<20: per-file splitting usually needs more pages; consider raising it")
 
 
 def cmd_resolve(args):
     repo = Path(args.repo).expanduser().resolve()
     if not repo.is_dir():
-        sys.exit(f"[dsh-wiki] 仓库路径不是目录或不存在: {repo}")
+        sys.exit(f"[dsh-wiki] repository path is not a directory or does not exist: {repo}")
     errors, warns = [], []
     resolved = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
     prov = {k: "builtin" for k in resolved}
@@ -1171,7 +1266,7 @@ def cmd_resolve(args):
     layers = {}
     for name, path in (("global", home_cfg), ("repo", repo_cfg)):
         if path.exists():
-            layers[name] = _read_json(path, f"{name} 配置")
+            layers[name] = _read_json(path, f"{name} config")
         else:
             layers[name] = None
     for name in ("global", "repo"):
@@ -1189,7 +1284,7 @@ def cmd_resolve(args):
     flag_sets = []
     for pair in (args.set or []):
         if "=" not in pair:
-            sys.exit(f"[dsh-wiki] --set 需要 k=v 形式，收到: {pair}")
+            sys.exit(f"[dsh-wiki] --set needs k=v, got: {pair}")
         key, raw = pair.split("=", 1)
         try:
             val = json.loads(raw)
@@ -1197,14 +1292,14 @@ def cmd_resolve(args):
             val = raw
         parts = key.split(".")
         if any(not part for part in parts):
-            errors.append(f"--set {key}: 路径段不能为空（形如 pages.max）")
+            errors.append(f"--set {key}: empty path segment (expected e.g. pages.max)")
             continue
         if parts[0] not in _KNOWN_KEYS and parts[0] != "profile":
-            errors.append(f"--set: 未知配置键 '{parts[0]}'"
-                          f"（可调键: {', '.join(sorted(_KNOWN_KEYS | {'profile'}))}）")
+            errors.append(f"--set: unknown config key '{parts[0]}'"
+                          f" (known keys: {', '.join(sorted(_KNOWN_KEYS | {'profile'}))})")
             continue
         if len(parts) > 1 and isinstance(resolved.get(parts[0]), list):
-            errors.append(f"--set {key}: '{parts[0]}' 是列表字段，不支持点路径下钻；请整体赋值（如 --set '{parts[0]}=[300,600]'）")
+            errors.append(f"--set {key}: '{parts[0]}' is a list field; dotted paths are not supported, assign the whole value (e.g. --set '{parts[0]}=[300,600]')")
             continue
         node = flag_cfg
         bad = False
@@ -1214,8 +1309,8 @@ def cmd_resolve(args):
                 nxt = {}
                 node[part] = nxt
             elif not isinstance(nxt, dict):
-                errors.append(f"--set {key}: '{part}' 不是对象（{type(nxt).__name__}），"
-                              f"不支持点路径下钻；列表字段请整体赋值")
+                errors.append(f"--set {key}: '{part}' is not an object ({type(nxt).__name__}); "
+                              f"dotted paths are not supported; assign list fields as a whole")
                 bad = True
                 break
             node = nxt
@@ -1232,7 +1327,7 @@ def cmd_resolve(args):
     _validate(resolved, errors, warns)
     if errors:
         for e in errors:
-            print(f"[dsh-wiki] FAIL 配置非法: {e}", file=sys.stderr)
+            print(f"[dsh-wiki] FAIL invalid config: {e}", file=sys.stderr)
         sys.exit(1)
 
     meta = {
@@ -1260,10 +1355,10 @@ def cmd_resolve(args):
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        sys.exit(f"[dsh-wiki] 无法创建 {out.parent}：{exc}")
+        sys.exit(f"[dsh-wiki] cannot create {out.parent}: {exc}")
     _write_text(out, json.dumps(meta, ensure_ascii=False, indent=2))
-    src_desc = ", ".join(f"{k}←{v}" for k, v in prov.items() if v != "builtin") or "全部默认"
-    print(f"[dsh-wiki] 生效配置已写入 {out}（覆盖: {src_desc}）", file=sys.stderr)
+    src_desc = ", ".join(f"{k}←{v}" for k, v in prov.items() if v != "builtin") or "all defaults"
+    print(f"[dsh-wiki] effective config written to {out} (overrides: {src_desc})", file=sys.stderr)
     for w in warns:
         print(f"[dsh-wiki] WARN {w}", file=sys.stderr)
 
@@ -1281,6 +1376,508 @@ def _source_commit(repo: Path):
     return sha if p.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", sha) else None
 
 
+# ---------------------------------------------------------------- diff impact (spec 007 T002)
+
+_DIFF_TIMEOUT = 5
+_DIFF_LINE_RE = re.compile(r":\d+(?:-\d+)?$")
+
+
+def _diff_fail(msg) -> None:
+    """diff-impact 的所有失败都用 exit 2 + 一行清晰原因（调用方按退出码区分失败类型）。"""
+    print(f"[dsh-wiki] {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _diff_git(repo: Path, args, label: str) -> str:
+    """跑一条本地 git 命令（参数数组 + shell=False + 5s 超时）；失败一律清晰报错 exit 2。
+
+    diff-impact 只读：git 只读 refs/对象，不写工作区、不联网、无副作用。
+    """
+    try:
+        p = subprocess.run(["git", "-C", str(repo), *args],
+                           capture_output=True, text=True, timeout=_DIFF_TIMEOUT)
+    except FileNotFoundError:
+        _diff_fail("diff-impact failed: git is not installed or not on PATH")
+    except subprocess.TimeoutExpired:
+        _diff_fail(f"diff-impact failed: git {label} timed out after {_DIFF_TIMEOUT}s")
+    except (OSError, subprocess.SubprocessError) as exc:
+        _diff_fail(f"diff-impact failed: cannot run git {label} ({exc})")
+    if p.returncode != 0:
+        lines = (p.stderr or p.stdout or "").strip().splitlines()
+        first = lines[0].strip() if lines else f"exit {p.returncode}"
+        _diff_fail(f"diff-impact failed: git {label} failed: {first}")
+    return p.stdout
+
+
+def _diff_rev(rev, label: str) -> str:
+    """拒绝会改变 `<from>..<to>` 语义的 rev 写法（选项注入、二次范围、空白）。"""
+    rev = str(rev if rev is not None else "").strip()
+    if not rev or rev.startswith("-") or ".." in rev or re.search(r"\s", rev):
+        _diff_fail(f"diff-impact failed: invalid {label} revision {rev!r}")
+    return rev
+
+
+def _diff_resolve(repo: Path, rev, label: str) -> str:
+    """把 rev 解析成完整 commit sha（报告里的 from/to 用 sha，可跨运行比对）。"""
+    out = _diff_git(repo, ["rev-parse", "--verify", f"{_diff_rev(rev, label)}^{{commit}}"],
+                    f"resolve {label}")
+    sha = out.strip().splitlines()[0].strip() if out.strip() else ""
+    if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", sha):
+        _diff_fail(f"diff-impact failed: cannot resolve {label} revision {rev!r}")
+    return sha
+
+
+def _diff_path(path) -> str:
+    """路径归一：正斜杠、去 ./ 前缀与尾部 /、去 :line（卡片 keyFiles 允许带行号）。"""
+    p = str(path or "").strip().replace("\\", "/")
+    p = _DIFF_LINE_RE.sub("", p)
+    while p.startswith("./"):
+        p = p[2:]
+    return p.rstrip("/")
+
+
+def _diff_match(changed: str, entry: str) -> bool:
+    """精确文件命中，或目录前缀命中（entry `lib` 覆盖 `lib/a.py`，不覆盖 `library/a.py`）。"""
+    return bool(entry) and (changed == entry or changed.startswith(entry + "/"))
+
+
+def _diff_hits(changed, raw_entries):
+    """改动的文件里，被这一组 filePaths/keyFiles 覆盖的部分（保持 git 输出顺序）。"""
+    entries = [_diff_path(x) for x in _as_str_list(raw_entries)]
+    return [f for f in changed if any(_diff_match(f, e) for e in entries)]
+
+
+def cmd_diff_impact(args):
+    """把 `<from>..<to>` 改动的文件映射到受影响的页面/卡片，JSON 报告写到 stdout。
+
+    严格只读：不 build、不写 config、不联网；仓库根默认取 wiki.json 的 repoId，
+    from 默认取 generation-meta.json（其次 wiki.json）记录的 sourceCommit，to 默认 HEAD。
+    """
+    wiki_dir = Path(args.wiki).expanduser()
+    wj = wiki_dir / "wiki.json"
+    data = _read_json(wj, "wiki.json")
+    if not isinstance(data, dict):
+        sys.exit(f"[dsh-wiki] {wj}: top level must be a JSON object")
+    meta = {}
+    gm = wiki_dir / "generation-meta.json"
+    if gm.is_file():
+        loaded = _read_json(gm, "generation-meta.json")
+        meta = loaded if isinstance(loaded, dict) else {}
+    if args.repo:
+        repo = Path(args.repo).expanduser()
+        if not repo.is_absolute():
+            repo = repo.resolve()
+    else:
+        repo_id = str(data.get("repoId") or "").strip()
+        if not repo_id:
+            _diff_fail("diff-impact failed: no repository to diff "
+                       "(wiki.json has no repoId; pass --repo <abs repo path>)")
+        repo = Path(repo_id).expanduser()
+        # 相对 repoId 以 wiki 目录为基准解析（与引用机检一致，不随 CWD 漂移）
+        repo = (wiki_dir / repo).resolve() if not repo.is_absolute() else repo
+    if not repo.is_dir():
+        _diff_fail(f"diff-impact failed: repository path is not a directory: {repo}")
+    from_rev = args.from_rev or meta.get("sourceCommit") or data.get("sourceCommit")
+    if not str(from_rev or "").strip():
+        _diff_fail("diff-impact failed: no source commit to diff from "
+                   "(generation-meta.json/wiki.json has no sourceCommit; pass --from <commit>)")
+    from_sha = _diff_resolve(repo, from_rev, "--from")
+    to_sha = _diff_resolve(repo, args.to_rev or "HEAD", "--to")
+    # core.quotePath=false：非 ASCII 路径按 UTF-8 原样输出，不被转义成 "\304\201"
+    out = _diff_git(repo, ["-c", "core.quotePath=false", "diff", "--name-only",
+                           f"{from_sha}..{to_sha}", "--"], "diff")
+    changed = []
+    for line in out.splitlines():
+        f = line.strip()
+        if f and f not in changed:
+            changed.append(f)
+    affected_pages, affected_cards = [], []
+    for p in data.get("pages") or []:
+        if not isinstance(p, dict):
+            continue
+        raw_id = p.get("id") if p.get("id") is not None else p.get("title")
+        if raw_id is None or not str(raw_id).strip():
+            continue
+        hits = _diff_hits(changed, p.get("filePaths"))
+        if hits:
+            affected_pages.append({"id": str(raw_id),
+                                   "title": str(p.get("title") or raw_id),
+                                   "matchedFiles": hits})
+    for c in data.get("cards") or []:
+        if not isinstance(c, dict):
+            continue
+        raw_id = c.get("id") if c.get("id") is not None else c.get("title")
+        if raw_id is None or not str(raw_id).strip():
+            continue
+        hits = _diff_hits(changed, c.get("keyFiles"))
+        if hits:
+            affected_cards.append({"id": str(raw_id),
+                                   "title": str(c.get("title") or raw_id),
+                                   "matchedFiles": hits})
+    mapped = {f for item in affected_pages + affected_cards for f in item["matchedFiles"]}
+    report = {
+        "from": from_sha,
+        "to": to_sha,
+        "changedFiles": changed,
+        "affectedPages": affected_pages,
+        "affectedCards": affected_cards,
+        "unmappedFiles": [f for f in changed if f not in mapped],
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print(f"[dsh-wiki] diff-impact: {len(changed)} changed files, {len(affected_pages)} pages, "
+          f"{len(affected_cards)} cards, {len(report['unmappedFiles'])} unmapped", file=sys.stderr)
+
+
+# ---------------------------------------------------------------- check translation (spec 007 T003)
+# 翻译快照的完整性比较只有一个实现：scripts/wiki_translations.py（报告 schema
+# repo-wiki-translation-check/1）。本子命令只做三件事——定位三份输入、把比较整体委托给
+# 该模块、把结果分别以人类可读（stderr）和 JSON（--json 时 stdout）输出。构建器绝不
+# 复制一份更弱的本地检查：模块导入失败就直接 exit 2。
+#
+# 退出码：0 = 全部单元 ok；1 = 存在 stale/missing/invalid/error；2 = 用法或 IO 问题
+# （缺 canonical/translation 目录、meta 不可读、模块导入失败）。命令严格只读：不写
+# canonical、不写 locales、不写其它任何位置（导入前就关掉 .pyc 落盘）。
+
+_CT_ID_PREVIEW = 10
+
+
+def _ct_fail(msg, command="check-translation") -> None:
+    """check-translation 的用法/IO 失败：一行清晰原因 + exit 2，不裸 traceback。"""
+    print(f"[dsh-wiki] {command} failed: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _load_translation_module():
+    """从同一 scripts 目录导入共享的翻译完整性模块（唯一的比较实现）。
+
+    导入失败（文件缺失、语法错误、被改名）一律 exit 2：降级成构建器自己的检查会让
+    "已验证"变成空话，所以这里没有 fallback。
+    """
+    scripts_dir = Path(__file__).resolve().parent
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    # 只读命令：连字节码都不要落在被检查的项目旁边
+    sys.dont_write_bytecode = True
+    try:
+        import wiki_translations as module
+    except Exception as exc:   # ImportError/SyntaxError/导入期任何异常
+        _ct_fail(f"cannot import the shared integrity module wiki_translations.py from "
+                 f"{scripts_dir} ({type(exc).__name__}: {exc}); the builder carries no "
+                 f"fallback comparison")
+    if not callable(getattr(module, "check_translation", None)):
+        _ct_fail(f"wiki_translations.py in {scripts_dir} does not expose check_translation(); "
+                 f"refusing to fall back to a local check")
+    return module
+
+
+def _ct_read_json(path: Path, label: str):
+    """读取并解析 JSON；任何问题都是 exit 2（用法/IO），与报告内的 status=error 区分。"""
+    if path.is_dir():
+        _ct_fail(f"{label} is a directory, not a file: {path}")
+    if not path.is_file():
+        _ct_fail(f"{label} does not exist: {path}")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        _ct_fail(f"{label} is not UTF-8 text: {path} ({exc})")
+    except OSError as exc:
+        _ct_fail(f"{label} is not readable: {path} ({exc})")
+    try:
+        return json.loads(text)
+    except RecursionError:
+        _ct_fail(f"{label}: JSON nested too deeply to parse: {path}")
+    except json.JSONDecodeError as exc:
+        _ct_fail(f"{label} is not valid JSON: {path} ({exc})")
+
+
+def _translation_locale_problem(module, tag):
+    """--lang 的校验规则必须与共享模块完全一致（不另写一套更松的规则）。
+
+    优先复用模块自己的校验函数；模块若没有它，就用模块自己的正则/长度常量（强度不变）；
+    两者都拿不到时返回问题而不是放行。
+    """
+    validator = getattr(module, "_locale_problem", None)
+    if callable(validator):
+        return validator(tag, "--lang")
+    pattern = getattr(module, "_LOCALE_RE", None)
+    limit = getattr(module, "_LOCALE_MAX", None)
+    if not isinstance(pattern, re.Pattern) or not isinstance(limit, int):
+        return ("cannot validate --lang: wiki_translations.py exposes no locale policy; "
+                "pass --translation <abs wiki dir> instead")
+    if not isinstance(tag, str) or not tag:
+        return "--lang is empty"
+    if len(tag) > limit:
+        return f"--lang is too long ({len(tag)} > {limit} chars)"
+    if ".." in tag or "/" in tag or "\\" in tag or "\x00" in tag:
+        return f"--lang contains path traversal characters: {tag!r}"
+    if not pattern.fullmatch(tag):
+        return f"--lang is not a BCP47-ish locale: {tag!r}"
+    return None
+
+
+def translation_check_report(canonical_dir, translation_dir, meta_path) -> dict:
+    """读取 canonical/translation/meta，把比较整体交给 wiki_translations.check_translation。
+
+    返回值就是模块生成的报告对象本身（schema repo-wiki-translation-check/1）；本函数
+    不修改、不补充、不重算任何字段。
+    """
+    module = _load_translation_module()
+    canonical = _ct_read_json(Path(canonical_dir) / "wiki.json", "canonical wiki.json")
+    translated = _ct_read_json(Path(translation_dir) / "wiki.json", "translated wiki.json")
+    meta = _ct_read_json(Path(meta_path), "translation-meta.json")
+    try:
+        return module.check_translation(canonical, translated, meta)
+    except RecursionError:
+        _ct_fail("input is nested too deeply to evaluate (recursion limit); "
+                 "reduce nesting and retry")
+
+
+def _ct_ids(ids) -> str:
+    shown = ", ".join(str(i) for i in ids[:_CT_ID_PREVIEW])
+    if len(ids) > _CT_ID_PREVIEW:
+        shown += f", +{len(ids) - _CT_ID_PREVIEW} more"
+    return shown
+
+
+def _translation_summary(report: dict, canonical_wiki: Path, translation_wiki: Path):
+    """把模块报告压成 stderr 上的人类可读摘要（机器数据仍只在 stdout 的 --json 里）。"""
+    counts = report.get("counts") or {}
+    pages = counts.get("pages") or {}
+    cards = counts.get("cards") or {}
+    src = report.get("sourceLang") or "?"
+    dst = report.get("targetLang") or "?"
+    head = "OK" if report.get("ok") else f"FAILED (status={report.get('status')})"
+    lines = [
+        f"check-translation: {head} — {src} -> {dst}; "
+        f"{pages.get('canonical', 0)} pages / {cards.get('canonical', 0)} cards canonical, "
+        f"{pages.get('translated', 0)} / {cards.get('translated', 0)} translated",
+        f"  canonical: {canonical_wiki}",
+        f"  translation: {translation_wiki}",
+    ]
+    if report.get("ok"):
+        return lines
+    for kind in ("pages", "cards"):
+        bucket = report.get(kind) or {}
+        c = counts.get(kind) or {}
+        lines.append(
+            f"  {kind}: {c.get('missing', 0)} missing, {c.get('stale', 0)} stale, "
+            f"{c.get('invalid', 0)} invalid, {c.get('added', 0)} added, "
+            f"{c.get('metaMissing', 0)} without metadata, {c.get('metaExtra', 0)} extra metadata")
+        for name in ("missing", "stale", "added", "metaMissing", "metaExtra"):
+            ids = bucket.get(name) or []
+            if ids:
+                lines.append(f"    {name} {kind[:-1]}: {_ct_ids(ids)}")
+        for entry in bucket.get("invalid") or []:
+            reasons = "; ".join(entry.get("reasons") or [])
+            lines.append(f"    invalid {kind[:-1]} {entry.get('id')!r}: {reasons}")
+    for err in report.get("errors") or []:
+        lines.append(f"  error: {err}")
+    for warn in report.get("warnings") or []:
+        lines.append(f"  warning: {warn}")
+    return lines
+
+
+def cmd_check_translation(args):
+    """校验一份已翻译快照；严格只读，比较逻辑全部委托给 wiki_translations.py。"""
+    module = _load_translation_module()
+    canonical_dir = Path(args.canonical).expanduser()
+    if not canonical_dir.is_dir():
+        _ct_fail(f"canonical wiki directory is not a directory or does not exist: {canonical_dir}")
+    if args.lang is not None and args.translation is not None:
+        _ct_fail("use either --lang <tag> or --translation <dir>, not both")
+    if args.lang is not None:
+        problem = _translation_locale_problem(module, args.lang)
+        if problem:
+            _ct_fail(problem)
+        # --lang 便利写法：翻译快照固定位于 <canonical>/locales/<lang>/
+        translation_dir = canonical_dir / "locales" / args.lang
+    elif args.translation is not None:
+        translation_dir = Path(args.translation).expanduser()
+    else:
+        _ct_fail("one of --translation <dir> or --lang <tag> is required")
+    if not translation_dir.is_dir():
+        _ct_fail(f"translation wiki directory is not a directory or does not exist: {translation_dir}")
+    meta_path = (Path(args.meta).expanduser() if args.meta
+                 else translation_dir / "translation-meta.json")
+    report = translation_check_report(canonical_dir, translation_dir, meta_path)
+    if args.json:
+        # 数据流：报告原文（ASCII 安全 + key 排序，便于跨平台/跨运行比对）
+        print(json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True))
+    for line in _translation_summary(report, canonical_dir / "wiki.json",
+                                     translation_dir / "wiki.json"):
+        print(f"[dsh-wiki] {line}", file=sys.stderr)
+    sys.exit(0 if report.get("ok") else 1)
+
+
+# ---------------------------------------------------------------- locales init (spec 007 T022)
+# 翻译快照的骨架由本子命令生成，但哈希与校验仍然只有 scripts/wiki_translations.py 一份
+# 实现：这里只复制结构、清空可翻译文本，并对每个单元调用模块的 canonical_unit_hash()。
+# 写入采用"locales 下的兄弟临时目录 + 一次 rename"：任何失败都清掉临时目录，绝不留下
+# 半成品目的地；--force 先把旧目的地移到备份，最终 rename 失败时把备份移回去。
+#
+# 退出码：0 = 目的地已创建/替换；2 = 用法、IO 或拒绝（已存在且未给 --force）。
+
+_LI_PAGE_TEXT_FALLBACK = ("title", "description", "markdown")
+_LI_CARD_TEXT_FALLBACK = ("title", "summary")
+
+
+def _li_text_fields(module, kind):
+    """可翻译文本字段以共享模块的定义为准（不另写一套 schema），模块缺常量时才兜底。"""
+    names = getattr(module, "_PAGE_TEXT_FIELDS" if kind == "page" else "_CARD_TEXT_FIELDS", None)
+    if isinstance(names, (list, tuple)) and names:
+        return tuple(names)
+    return _LI_PAGE_TEXT_FALLBACK if kind == "page" else _LI_CARD_TEXT_FALLBACK
+
+
+def _li_skeleton(canonical, lang, module):
+    """纯函数：canonical wiki → (空文本骨架, translation-meta)，不落盘。
+
+    结构字段（id/顺序/parentId/order/filePaths/keyFiles/related/tags/pageIds/sources
+    以及未知扩展字段）逐字保留；只有可翻译文本清空，language 写成目标标签——否则
+    check-translation 会因 translated.language 与 targetLang 不一致而无法评估。
+    """
+    if not isinstance(canonical, dict):
+        raise ValueError("canonical wiki.json must be a JSON object")
+    for key in ("pages", "cards"):
+        value = canonical.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, list):
+            raise ValueError(f"canonical {key} must be an array")
+        for index, item in enumerate(value):
+            if not isinstance(item, dict):
+                raise ValueError(f"canonical {key}[{index}] is not an object")
+            item_id = item.get("id")
+            if not isinstance(item_id, str) or not item_id.strip():
+                raise ValueError(f"canonical {key}[{index}] has no non-empty string id")
+    skeleton = copy.deepcopy(canonical)
+    skeleton["language"] = lang
+    if "title" in skeleton:
+        skeleton["title"] = ""
+    for kind, key in (("page", "pages"), ("card", "cards")):
+        for item in skeleton.get(key) or []:
+            for field in _li_text_fields(module, kind):
+                if field in item:
+                    item[field] = ""
+    source_lang = canonical.get("language")
+    meta = {
+        "schema": "repo-wiki-translation-meta/1",
+        "sourceLang": source_lang if isinstance(source_lang, str) and source_lang else "en",
+        "targetLang": lang,
+        "pages": {item["id"]: {"sourceContentHash": module.canonical_unit_hash("page", item)}
+                  for item in canonical.get("pages") or []},
+        "cards": {item["id"]: {"sourceContentHash": module.canonical_unit_hash("card", item)}
+                  for item in canonical.get("cards") or []},
+    }
+    return skeleton, meta
+
+
+def _li_write_json(path: Path, data) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+
+
+def _li_rename(src: Path, dst: Path) -> None:
+    os.replace(src, dst)
+
+
+def _li_remove(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    elif path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def locales_init(canonical_dir, lang, force=False) -> dict:
+    """创建 <canonical>/locales/<lang>/ 空翻译骨架；返回机器摘要（打印由 CLI 负责）。"""
+    module = _load_translation_module()
+    problem = _translation_locale_problem(module, lang)
+    if problem:
+        _ct_fail(problem, "locales-init")
+    canonical_dir = Path(canonical_dir).expanduser()
+    if not canonical_dir.is_dir():
+        _ct_fail(f"canonical wiki directory is not a directory or does not exist: {canonical_dir}",
+                 "locales-init")
+    canonical = _ct_read_json(canonical_dir / "wiki.json", "canonical wiki.json")
+    try:
+        skeleton, meta = _li_skeleton(canonical, lang, module)
+    except ValueError as exc:
+        _ct_fail(str(exc), "locales-init")
+    locales_dir = canonical_dir / "locales"
+    destination = locales_dir / lang
+    if (destination.exists() or destination.is_symlink()) and not force:
+        _ct_fail(f"destination already exists: {destination} (pass --force to replace it)",
+                 "locales-init")
+
+    unique = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    locales_created = not locales_dir.exists()
+    temp = locales_dir / f".{lang}.tmp-{unique}"
+    backup = locales_dir / f".{lang}.bak-{unique}"
+    replaced = False
+    failure = None
+    try:
+        if locales_dir.exists():
+            if not locales_dir.is_dir():
+                raise OSError(f"{locales_dir} exists and is not a directory")
+        else:
+            locales_dir.mkdir(parents=True)
+        temp.mkdir()
+        _li_write_json(temp / "wiki.json", skeleton)
+        _li_write_json(temp / "translation-meta.json", meta)
+        if destination.exists() or destination.is_symlink():
+            # --force：先让旧目的地让位，最终 rename 失败则原样移回，目的地不会缺失。
+            _li_rename(destination, backup)
+            try:
+                _li_rename(temp, destination)
+            except OSError:
+                _li_rename(backup, destination)
+                raise
+            replaced = True
+        else:
+            _li_rename(temp, destination)
+    except Exception as exc:   # 写入/rename 的任何异常都不能留下半成品
+        failure = exc
+    finally:
+        _li_remove(temp)
+        if failure is None:
+            _li_remove(backup)
+        elif locales_created:
+            # 本次运行才创建的 locales/ 在失败后不留空壳；已存在时绝不删除。
+            try:
+                locales_dir.rmdir()
+            except OSError:
+                pass
+    if failure is not None:
+        _ct_fail(f"cannot create {destination}: {type(failure).__name__}: {failure}",
+                 "locales-init")
+    return {
+        "ok": True,
+        "canonical": str(canonical_dir),
+        "destination": str(destination),
+        "lang": lang,
+        "replaced": replaced,
+        "pages": len(skeleton.get("pages") or []),
+        "cards": len(skeleton.get("cards") or []),
+        "wiki": str(destination / "wiki.json"),
+        "meta": str(destination / "translation-meta.json"),
+    }
+
+
+def cmd_locales_init(args):
+    """生成空翻译骨架：数据摘要只在 --json 时进 stdout，人读结果固定进 stderr。"""
+    summary = locales_init(Path(args.canonical), args.lang, force=args.force)
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True))
+    action = "replaced" if summary["replaced"] else "created"
+    print(f"[dsh-wiki] locales-init: {action} {summary['destination']} "
+          f"({summary['pages']} pages, {summary['cards']} cards, lang {summary['lang']}); "
+          f"fill the text fields, then verify with "
+          f"check-translation --canonical {summary['canonical']} --lang {summary['lang']}",
+          file=sys.stderr)
+
+
 # ---------------------------------------------------------------- assemble
 
 _FM_KEYS_PAGE = ("id", "parentId", "order", "title", "description", "filePaths")
@@ -1295,7 +1892,7 @@ def _parse_front_matter(text: str, label: str):
         return None, text
     end = text.find("\n---", 4)
     if end < 0:
-        sys.exit(f"[dsh-wiki] {label}: front-matter 未闭合（缺结束 ---）")
+        sys.exit(f"[dsh-wiki] {label}: unterminated front-matter (missing closing ---)")
     head, body = text[4:end], text[end + 4:]
     body = body[1:] if body.startswith("\n") else body
     meta = {}
@@ -1303,7 +1900,7 @@ def _parse_front_matter(text: str, label: str):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         if ":" not in line:
-            sys.exit(f"[dsh-wiki] {label}:{n}: front-matter 行需为 key: value")
+            sys.exit(f"[dsh-wiki] {label}:{n}: front-matter lines must be key: value")
         k, v = line.split(":", 1)
         v = v.strip()
         try:
@@ -1319,13 +1916,13 @@ def _assemble_files(src_dir: Path, wiki_dir: Path, warns, label: str):
     out = []
     for f in sorted(src_dir.glob("*.md")):
         if f.is_symlink():
-            warns.append(f"{label}/{f.name} 是符号链接，已跳过")
+            warns.append(f"{label}/{f.name} is a symlink; skipped")
             continue
         try:
             real = f.resolve()
             real.relative_to(root)
         except (OSError, ValueError):
-            warns.append(f"{label}/{f.name} 解析后不在 wiki 目录内，已跳过")
+            warns.append(f"{label}/{f.name} resolves outside the wiki directory; skipped")
             continue
         if not real.is_file():
             continue
@@ -1343,9 +1940,9 @@ def _fm_text_fields(meta: dict, keys, where: str, warns) -> bool:
             continue
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             meta[k] = str(v)
-            warns.append(f"{where}: front-matter {k} 不是字符串（{v!r}），已转为 {meta[k]!r}")
+            warns.append(f"{where}: front-matter {k} is not a string ({v!r}); converted to {meta[k]!r}")
             continue
-        warns.append(f"{where}: front-matter {k} 类型非法（{type(v).__name__}），已跳过该文件")
+        warns.append(f"{where}: front-matter {k} has invalid type ({type(v).__name__}); file skipped")
         return False
     return True
 
@@ -1356,37 +1953,37 @@ def cmd_assemble(args):
     wiki_dir = Path(args.wiki).expanduser()
     pages_dir = wiki_dir / "pages"
     if not pages_dir.is_dir():
-        sys.exit(f"[dsh-wiki] assemble 失败: 缺 {pages_dir}")
+        sys.exit(f"[dsh-wiki] assemble failed: missing {pages_dir}")
     wj = wiki_dir / "wiki.json"
     data = _read_json(wj, "wiki.json") if wj.exists() else {}
     if not isinstance(data, dict):
-        sys.exit(f"[dsh-wiki] {wj} 顶层必须是 JSON 对象")
+        sys.exit(f"[dsh-wiki] {wj}: top level must be a JSON object")
     data.setdefault("schema", "repo-wiki-local/1")
     for key in ("repo", "title", "language"):
         val = getattr(args, key, None)
         if val:
             data["repoId" if key == "repo" else key] = val
     if not data.get("repoId"):
-        sys.exit("[dsh-wiki] assemble 失败: wiki.json 无 repoId，请用 --repo 指定仓库路径")
+        sys.exit("[dsh-wiki] assemble failed: wiki.json has no repoId; pass --repo <repository path>")
     data["generatedBy"] = data.get("generatedBy") or "agent"
     warns, pages = [], []
     for f in _assemble_files(pages_dir, wiki_dir, warns, "pages"):
         meta, body = _parse_front_matter(f.read_text(encoding="utf-8"), str(f))
         if meta is None:
-            warns.append(f"{f.name} 无 front-matter，id 取文件名")
+            warns.append(f"{f.name} has no front-matter; id taken from the file name")
             meta = {}
         if not _fm_text_fields(meta, ("id", "title", "parentId", "description"), f"pages/{f.name}", warns):
             continue
         unknown = set(meta) - set(_FM_KEYS_PAGE)
         if unknown:
-            warns.append(f"{f.name}: 忽略未知 front-matter 键 {', '.join(sorted(unknown))}")
+            warns.append(f"{f.name}: ignoring unknown front-matter keys {', '.join(sorted(unknown))}")
         page = {k: meta[k] for k in _FM_KEYS_PAGE if k in meta}
         page.setdefault("id", f.stem)
         page.setdefault("parentId", None)
         page["markdown"] = body
         pages.append(page)
     if not pages:
-        sys.exit(f"[dsh-wiki] assemble 失败: {pages_dir} 下没有 *.md")
+        sys.exit(f"[dsh-wiki] assemble failed: no *.md in {pages_dir}")
     pages.sort(key=lambda p: (0, p["order"]) if isinstance(p.get("order"), (int, float)) else (1, 0))
     data["pages"] = pages
     cards_dir = wiki_dir / "cards"
@@ -1399,7 +1996,7 @@ def cmd_assemble(args):
                 continue
             unknown = set(meta) - set(_FM_KEYS_CARD)
             if unknown:
-                warns.append(f"cards/{f.name}: 忽略未知 front-matter 键 {', '.join(sorted(unknown))}")
+                warns.append(f"cards/{f.name}: ignoring unknown front-matter keys {', '.join(sorted(unknown))}")
             card = {k: meta[k] for k in _FM_KEYS_CARD if k in meta}
             card.setdefault("id", f.stem)
             card["summary"] = " ".join(body.split())
@@ -1409,7 +2006,7 @@ def cmd_assemble(args):
         print(f"[dsh-wiki] WARN {w}", file=sys.stderr)
     _write_text(wj, json.dumps(data, ensure_ascii=False, indent=1) + "\n")
     n_cards = len(data.get("cards") or []) if isinstance(data.get("cards"), list) else 0
-    print(f"[dsh-wiki] assemble: {len(pages)} 页, {n_cards} 张卡片 → {wj}")
+    print(f"[dsh-wiki] assemble: {len(pages)} pages, {n_cards} cards -> {wj}")
 
 
 # ---------------------------------------------------------------- import legacy
@@ -1438,19 +2035,19 @@ def load_legacy(source: Path):
                 bad_files.append(f"{f.name}: {exc}")
                 continue
             if not isinstance(p, dict):
-                bad_files.append(f"{f.name}: 顶层不是 JSON 对象")
+                bad_files.append(f"{f.name}: top level is not a JSON object")
                 continue
             if p.get("markdown") is not None and not isinstance(p.get("markdown"), str):
-                bad_files.append(f"{f.name}: markdown 不是字符串")
+                bad_files.append(f"{f.name}: markdown is not a string")
                 continue
             if _page_has_markdown(p):
                 pages.append(p)
     if bad_files:
-        print(f"[dsh-wiki] WARN {len(bad_files)} 个 draft-pages 文件不可解析: "
+        print(f"[dsh-wiki] WARN {len(bad_files)} draft-pages files could not be parsed: "
               f"{'; '.join(bad_files[:5])}", file=sys.stderr)
     if not pages:
-        detail = f"（其中 {len(bad_files)} 个文件解析失败）" if bad_files else ""
-        sys.exit(f"[dsh-wiki] {source} 里既无含正文的 wiki.json，也无可用 draft-pages{detail}")
+        detail = f" ({len(bad_files)} files failed to parse)" if bad_files else ""
+        sys.exit(f"[dsh-wiki] {source} has neither a wiki.json with page bodies nor usable draft-pages{detail}")
     draft = {}
     dj = source / "draft.json"
     if dj.exists():
@@ -1458,7 +2055,7 @@ def load_legacy(source: Path):
         draft = d if isinstance(d, dict) else {}
     catalog = meta_src.get("catalogTree") or draft.get("catalogTree") or []
     if not isinstance(catalog, list):
-        print("[dsh-wiki] WARN legacy catalogTree 不是列表，已忽略", file=sys.stderr)
+        print("[dsh-wiki] WARN legacy catalogTree is not a list; ignored", file=sys.stderr)
         catalog = []
     return meta_src, draft, pages, catalog
 
@@ -1478,19 +2075,19 @@ def merge_catalog(catalog, pages, warns=None):
     merged, mounted, seen_nodes = [], set(), set()
     stack = [(nd, None) for nd in reversed(catalog) if isinstance(nd, dict)]
     for bad in [nd for nd in catalog if not isinstance(nd, dict)]:
-        warns.append(f"catalogTree 节点不是对象（{type(bad).__name__}），已跳过")
+        warns.append(f"catalogTree node is not an object ({type(bad).__name__}); skipped")
 
     while stack:
         nd, parent_actual = stack.pop()
         nid = str(nd.get("id") or "")
         if nid and nid in seen_nodes:
-            warns.append(f"catalogTree 节点 id 重复: {nid}")
+            warns.append(f"duplicate catalogTree node id: {nid}")
         seen_nodes.add(nid)
         kids = nd.get("children")
         if kids is None:
             kids = []
         elif not isinstance(kids, list):
-            warns.append(f"catalogTree 节点 {nid or '?'} 的 children 不是列表，已忽略")
+            warns.append(f"catalogTree node {nid or '?'}: children is not a list; ignored")
             kids = []
         pid = nd.get("pageId")
         if pid is not None and str(pid) in by_id and str(pid) not in mounted:
@@ -1501,19 +2098,19 @@ def merge_catalog(catalog, pages, warns=None):
             child_parent = page.get("id") if page.get("id") is not None else pid
         else:
             if pid is not None and str(pid) in mounted:
-                warns.append(f"catalogTree 节点 {nid or '?'} 重复引用页面 {pid}，生成导览页代替")
+                warns.append(f"catalogTree node {nid or '?'} references page {pid} again; generated a section overview instead")
             base = nid or "section"
             sid, k = base, 2
             while sid in used:
                 sid = f"{base}-sec{k}"
                 k += 1
             used.add(sid)
-            toc = "## 本节导览\n\n" + "\n".join(
+            toc = "## In this section\n\n" + "\n".join(
                 f"- {c.get('title')}" for c in kids if isinstance(c, dict)) if kids else ""
             merged.append({
                 "id": sid,
                 "parentId": parent_actual or None,
-                "title": nd.get("title") or nid or "本节",
+                "title": nd.get("title") or nid or "Section",
                 "order": nd.get("order"),
                 "description": "",
                 "filePaths": [],
@@ -1525,7 +2122,7 @@ def merge_catalog(catalog, pages, warns=None):
             if isinstance(k, dict):
                 stack.append((k, child_parent))
             else:
-                warns.append(f"catalogTree 节点不是对象（{type(k).__name__}），已跳过")
+                warns.append(f"catalogTree node is not an object ({type(k).__name__}); skipped")
     orphans = 0
     for p in pages:
         if not isinstance(p, dict):
@@ -1558,14 +2155,14 @@ def cmd_import(args):
     if not src.is_absolute():
         src = LEGACY_BASE / src
     if not src.exists():
-        sys.exit(f"[dsh-wiki] 找不到 {src}")
+        sys.exit(f"[dsh-wiki] not found: {src}")
     meta_src, draft, raw_pages, catalog = load_legacy(src)
     warns: list = []
     merged, total, orphans = merge_catalog(catalog, raw_pages, warns)
     for w in warns:
         print(f"[dsh-wiki] WARN {w}", file=sys.stderr)
     if orphans:
-        print(f"[dsh-wiki] WARN {orphans} 个内容页不在目录树中，已降级为根节点", file=sys.stderr)
+        print(f"[dsh-wiki] WARN {orphans} content pages are not in the catalog tree; promoted to roots", file=sys.stderr)
     deduped = 0
     for p in merged:
         md = p.get("markdown")
@@ -1575,7 +2172,7 @@ def cmd_import(args):
                 p["markdown"] = stripped
                 deduped += 1
     if deduped:
-        print(f"[dsh-wiki] 已去掉 {deduped} 页与页头 h1 重复的首行标题")
+        print(f"[dsh-wiki] removed a leading heading duplicating the page title on {deduped} pages")
     repo_id = meta_src.get("repoId") or draft.get("repoId") or ""
     explicit_dest = bool(args.dest)
     if args.dest:
@@ -1590,13 +2187,13 @@ def cmd_import(args):
     try:
         dest_res, src_res = dest.resolve(), src.resolve()
     except OSError as exc:
-        sys.exit(f"[dsh-wiki] 路径解析失败：{exc}")
-    where = "--dest" if explicit_dest else "默认目标（由 repoId 推导）"
+        sys.exit(f"[dsh-wiki] path resolution failed: {exc}")
+    where = "--dest" if explicit_dest else "default destination (derived from repoId)"
     if dest_res == src_res:
-        sys.exit(f"[dsh-wiki] 拒绝导入: {where} 指向 legacy 源目录本身（{src}），会不可逆覆写源数据")
+        sys.exit(f"[dsh-wiki] import refused: {where} is the legacy source directory itself ({src}); that would irreversibly overwrite the source")
     if dest_res in src_res.parents:
         # dest 是 src 的上级（如指向 legacy 库根）：会把产物写进库根，拒绝
-        sys.exit(f"[dsh-wiki] 拒绝导入: {where}（{dest}）是 legacy 源目录的上级，请使用独立目录")
+        sys.exit(f"[dsh-wiki] import refused: {where} ({dest}) is a parent of the legacy source directory; use a separate directory")
     if src_res in dest_res.parents:
         # dest 在 src 内（文档化的默认情形）：仅允许全新/空目录或本工具产物，
         # 防止把 wiki.json/pages 写进 legacy 数据目录（如 src/draft-pages）或其父级
@@ -1610,10 +2207,10 @@ def cmd_import(args):
                 except Exception:
                     ok = False
             if not ok:
-                sys.exit(f"[dsh-wiki] 拒绝导入: {where}（{dest}）位于 legacy 源目录内且已含其他文件，"
-                         f"请使用空的子目录（如 <src>/.dsh-wiki）或独立目录")
+                sys.exit(f"[dsh-wiki] import refused: {where} ({dest}) is inside the legacy source directory and already has other files; "
+                         f"use an empty subdirectory (e.g. <src>/.dsh-wiki) or a separate directory")
     if dest.exists() and not dest.is_dir():
-        sys.exit(f"[dsh-wiki] 拒绝导入: --dest 已存在且不是目录: {dest}")
+        sys.exit(f"[dsh-wiki] import refused: --dest exists and is not a directory: {dest}")
     dest_wj = dest / "wiki.json"
     if dest_wj.is_file():
         try:
@@ -1621,12 +2218,12 @@ def cmd_import(args):
         except Exception:
             prev = None
         if not isinstance(prev, dict) or prev.get("generatedBy") != "import-legacy":
-            sys.exit(f"[dsh-wiki] 拒绝导入: {dest_wj} 已存在且非本工具导入产物，"
-                     f"请改用其他 --dest 或先移走该目录")
+            sys.exit(f"[dsh-wiki] import refused: {dest_wj} exists and was not produced by this importer; "
+                     f"choose another --dest or move that directory away first")
     try:
         dest.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        sys.exit(f"[dsh-wiki] 无法创建目标目录 {dest}：{exc}")
+        sys.exit(f"[dsh-wiki] cannot create destination directory {dest}: {exc}")
     wiki = {
         "schema": "repo-wiki-local/1",
         "repoId": repo_id or src.name,
@@ -1646,12 +2243,12 @@ def cmd_import(args):
     try:
         pages_dir.mkdir(exist_ok=True)
     except OSError as exc:
-        sys.exit(f"[dsh-wiki] 无法创建 {pages_dir}：{exc}")
+        sys.exit(f"[dsh-wiki] cannot create {pages_dir}: {exc}")
     for f in pages_dir.glob("*.md"):
         try:
             f.unlink()
         except OSError as exc:
-            sys.exit(f"[dsh-wiki] 无法清理旧导出 {f}：{exc}")
+            sys.exit(f"[dsh-wiki] cannot remove old export {f}: {exc}")
     used_names: set = set()
     for p in merged:
         pid = re.sub(r"[^A-Za-z0-9_-]", "-", str(p.get("id") or "page")) or "page"
@@ -1662,19 +2259,19 @@ def cmd_import(args):
         used_names.add(pid)
         _write_text(pages_dir / f"{pid}.md", p.get("markdown") or "")
     info = build_site(dest)
-    print(f"[dsh-wiki] 导入完成: {src.name} → {dest_res}")
-    print(f"[dsh-wiki] 页数 {info['pages']}, 站点 {info['path']} ({info['bytes'] // 1024} KB), "
-          f"mermaid离线渲染 {'✓' if info['mermaid'] else '✗(仅源码)'}")
-    print(f"[dsh-wiki] 用浏览器打开: {info['path']}")
+    print(f"[dsh-wiki] import complete: {src.name} -> {dest_res}")
+    print(f"[dsh-wiki] {info['pages']} pages, site {info['path']} ({info['bytes'] // 1024} KB), "
+          f"mermaid offline rendering {'yes' if info['mermaid'] else 'no (source only)'}")
+    print(f"[dsh-wiki] open in a browser: {info['path']}")
 
 
 # ---------------------------------------------------------------- build / selfcheck
 
 def cmd_build(args):
     info = build_site(Path(args.wiki).expanduser())
-    cards = f" + {info['cards']} 张卡片" if info.get("cards") else ""
-    print(f"[dsh-wiki] 构建: {info['pages']} 页{cards} → {info['path']} ({info['bytes'] // 1024} KB), "
-          f"mermaid离线渲染 {'✓' if info['mermaid'] else '✗(仅源码)'}")
+    cards = f" + {info['cards']} cards" if info.get("cards") else ""
+    print(f"[dsh-wiki] build: {info['pages']} pages{cards} -> {info['path']} ({info['bytes'] // 1024} KB), "
+          f"mermaid offline rendering {'yes' if info['mermaid'] else 'no (source only)'}")
 
 
 # 外链扫描：脚本块（内联 bundle / INDEX JSON）先整体剔除，只在真实 HTML 片段里
@@ -1775,7 +2372,7 @@ def _external_refs(doc: str):
             if attr == "xmlns" or attr.startswith("xmlns:") or attr.startswith("data-"):
                 continue
             if attr == "srcdoc":
-                found.append(f"<{tag}> srcdoc=<内联 HTML 文档>")
+                found.append(f"<{tag}> srcdoc=<inline HTML document>")
                 continue
             if attr == "content":
                 mm = re.search(r"(?i)\burl\s*=\s*['\"]?\s*([^'\";]+)", val)
@@ -1813,7 +2410,42 @@ _REF_EXTS = ("ts|tsx|js|jsx|cjs|mjs|json|md|wxml|py|go|rs|swift|kt|java|vue|yml|
              "|sh|bash|zsh|c|h|m|txt|ini|cfg|conf|env|properties|gradle|proto|graphql|tf")
 _REF_RE = re.compile(
     r"`([A-Za-z0-9._\-/]+\.(?:" + _REF_EXTS + r")):(\d+)(?:-(\d+))?`", re.I)
-_REF_SKIP_WARN = "引用机检跳过（仓库根不可用，无法解析相对路径）"
+_REF_SKIP_WARN = "citation check skipped (repository root unavailable; relative paths cannot be resolved)"
+# 简写引用回退解析时跳过的目录：VCS、依赖、缓存、本 wiki 输出目录（wiki_dir 整棵子树）。
+_REF_IGNORE_DIRS = frozenset({
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".cache", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache", ".tox", ".venv", "venv"})
+_REF_WIKI_SUBDIRS = ("site", "locales")
+
+
+def _basename_index(repo_root: Path, wiki_dir: Path):
+    """basename → 仓库内相对路径列表，供简写引用的唯一命中回退使用。
+
+    只遍历一次；跳过 VCS/依赖/缓存目录与本次 wiki 的输出目录，因此只存在于被忽略
+    目录里的同名文件永远不会成为候选（引用它仍然失败）。
+    """
+    wiki_abs = os.path.normcase(os.path.abspath(str(wiki_dir)))
+    repo_abs = os.path.normcase(os.path.abspath(str(repo_root)))
+    skip_abs = {wiki_abs}
+    if wiki_abs == repo_abs:
+        # repoId "." 时 wiki 目录就是仓库根：单独跳过构建器自己的产物目录，
+        # 否则 site/index.html 这类文件会被当成仓库文件命中简写引用。
+        skip_abs.update(os.path.normcase(os.path.abspath(os.path.join(repo_abs, d)))
+                        for d in _REF_WIKI_SUBDIRS)
+    index = defaultdict(list)
+    for dirpath, dirnames, filenames in os.walk(str(repo_root)):
+        kept = []
+        for d in dirnames:
+            if d in _REF_IGNORE_DIRS or d.endswith("_cache"):
+                continue
+            if os.path.normcase(os.path.abspath(os.path.join(dirpath, d))) in skip_abs:
+                continue
+            kept.append(d)
+        dirnames[:] = kept
+        for name in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, name), str(repo_root))
+            index[name].append(rel.replace(os.sep, "/"))
+    return index
 
 
 def _check_refs(repo_id, pages, problems, warns, wiki_dir: Path):
@@ -1824,7 +2456,7 @@ def _check_refs(repo_id, pages, problems, warns, wiki_dir: Path):
     """
     repo_id = str(repo_id or "")
     if not repo_id:
-        warns.append(_REF_SKIP_WARN + ": 未记录")
+        warns.append(_REF_SKIP_WARN + ": not recorded")
         return
     repo_root = Path(repo_id).expanduser()
     if not repo_root.is_absolute():
@@ -1836,6 +2468,14 @@ def _check_refs(repo_id, pages, problems, warns, wiki_dir: Path):
     file_lines = {}
     n_checked = 0
     n_before = len(problems)
+    # 简写回退索引：整次检查最多构建一次，且只有出现第 1 步解析不了的引用时才构建。
+    index_holder = []
+
+    def basename_matches(name):
+        if not index_holder:
+            index_holder.append(_basename_index(repo_root, wiki_dir))
+        return sorted(index_holder[0].get(name) or [])
+
     for p in pages:
         for m in _REF_RE.finditer(p.get("markdown") or ""):
             n_checked += 1
@@ -1843,33 +2483,50 @@ def _check_refs(repo_id, pages, problems, warns, wiki_dir: Path):
             e = int(m.group(3) or m.group(2))
             rel_norm = os.path.normpath(rel)
             if os.path.isabs(rel_norm) or rel_norm == ".." or rel_norm.startswith(".." + os.sep):
-                problems.append(f"页面 {p.get('id')}: 引用越出仓库范围 {rel}")
+                problems.append(f"page {p.get('id')}: citation escapes the repository {rel}")
                 continue
             f = repo_root / rel_norm
             if not f.is_file():
-                problems.append(f"页面 {p.get('id')}: 引用文件不存在 {rel}")
-                continue
+                # 第 2 步：仓库根相对解析失败后，才允许"唯一文件名"回退；多命名歧义仍失败。
+                shorthand = f"{rel}:{s}" + (f"-{e}" if e != s else "")
+                matches = basename_matches(os.path.basename(rel_norm))
+                if len(matches) == 1:
+                    f = repo_root / matches[0]
+                    warns.append(
+                        f"page {p.get('id')}: citation uses the bare filename {shorthand} "
+                        f"(unique match -> {matches[0]}; cite the full path)")
+                elif len(matches) > 1:
+                    shown = ", ".join(matches[:5])
+                    if len(matches) > 5:
+                        shown += f", +{len(matches) - 5} more"
+                    problems.append(
+                        f"page {p.get('id')}: cited file is AMBIGUOUS {shorthand} (matches "
+                        f"{len(matches)}: {shown}; cite the full path)")
+                    continue
+                else:
+                    problems.append(f"page {p.get('id')}: cited file does not exist {rel}")
+                    continue
             if rel not in line_counts:
                 try:
                     text = f.read_text(encoding="utf-8", errors="replace")
                 except OSError:
-                    problems.append(f"页面 {p.get('id')}: 引用文件不可读 {rel}")
+                    problems.append(f"page {p.get('id')}: cited file is not readable {rel}")
                     continue
                 line_counts[rel] = text.count("\n") + 1
                 file_lines[rel] = text.split("\n")
             if s < 1 or e < s or e > line_counts[rel]:
                 problems.append(
-                    f"页面 {p.get('id')}: 行号越界 {rel}:{s}-{e}（文件共 {line_counts[rel]} 行）")
+                    f"page {p.get('id')}: line out of range {rel}:{s}-{e} (file has {line_counts[rel]} lines)")
             elif not file_lines[rel][s - 1:e] or not any(x.strip() for x in file_lines[rel][s - 1:e]):
                 # 行号在界内但指向空行：多半是写作时行号偏移，机检放行但提示复核
-                warns.append(f"页面 {p.get('id')}: 引用指向空行 {rel}:{s}" + (f"-{e}" if e != s else "")
-                             + "（行号可能偏移，请复核）")
+                warns.append(f"page {p.get('id')}: citation points to a blank line {rel}:{s}" + (f"-{e}" if e != s else "")
+                             + " (line numbers may have shifted; please re-check)")
     if n_checked:
         n_bad = len(problems) - n_before
         if n_bad:
-            print(f"[dsh-wiki] 引用机检: {n_checked} 处中 {n_bad} 处失败（见 FAIL）")
+            print(f"[dsh-wiki] citation check: {n_bad} of {n_checked} failed (see FAIL)")
         else:
-            print(f"[dsh-wiki] 引用机检: {n_checked} 处 path:line 引用全部可解析")
+            print(f"[dsh-wiki] citation check: all {n_checked} path:line citations resolve")
 
 
 def cmd_selfcheck(args):
@@ -1877,16 +2534,16 @@ def cmd_selfcheck(args):
     problems, warns = [], []
     wj = wiki_dir / "wiki.json"
     if not wj.exists():
-        sys.exit(f"[dsh-wiki] selfcheck 失败: 缺 {wj}")
+        sys.exit(f"[dsh-wiki] selfcheck failed: missing {wj}")
     data = _read_json(wj, "wiki.json")
     if not isinstance(data, dict):
-        sys.exit(f"[dsh-wiki] selfcheck 失败: {wj} 顶层必须是 JSON 对象")
+        sys.exit(f"[dsh-wiki] selfcheck failed: {wj}: top level must be a JSON object")
     pages = normalize_pages(data.get("pages") or [], warns)
     ids = {p["id"] for p in pages}
     for p in pages:
         pid = p.get("parentId")
         if pid and pid not in ids:
-            warns.append(f"页面 {p['id']} 的父 {pid} 缺失（降级为根）")
+            warns.append(f"page {p['id']}: parent {pid} missing (promoted to root)")
     # 环检测：normalize 后 id 唯一；只报实际环成员（旁支节点不计入）
     parent = {p["id"]: p.get("parentId") for p in pages}
     reported = set()
@@ -1898,30 +2555,30 @@ def cmd_selfcheck(args):
                 key = tuple(sorted(cycle))
                 if key not in reported:
                     reported.add(key)
-                    problems.append(f"页面树存在环: {' → '.join(cycle + [cur])}")
+                    problems.append(f"page tree has a cycle: {' -> '.join(cycle + [cur])}")
                 break
             seen[cur] = len(chain)
             chain.append(cur)
             cur = parent[cur]
     site = wiki_dir / "site" / "index.html"
     if not site.is_file():
-        problems.append(f"缺站点文件 {site}")
+        problems.append(f"missing site file {site}")
     else:
         try:
             doc = site.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError) as exc:
             doc = None
-            problems.append(f"站点文件不可读/损坏 {site}（{exc}）")
+            problems.append(f"site file unreadable/corrupt {site} ({exc})")
         if doc is not None:
             if len(doc) < 512 or "<!DOCTYPE html" not in doc or "<main" not in doc:
-                problems.append(f"站点文件内容不完整（{len(doc)} 字符，缺 DOCTYPE/main 结构）: {site}")
+                problems.append(f"site file incomplete ({len(doc)} chars, missing DOCTYPE/main structure): {site}")
             for ref in _external_refs(doc):
-                problems.append(f"外链 {ref}")
+                problems.append(f"external link {ref}")
             if not _mermaid_inlined(doc):
-                warns.append("站点未内联 mermaid 运行时（图表将仅显源码）")
+                warns.append("site does not inline the mermaid runtime (diagrams will show source only)")
     raw_cards = data.get("cards")
     if raw_cards is not None and not isinstance(raw_cards, list):
-        problems.append(f"cards 不是数组（{type(raw_cards).__name__}）")
+        problems.append(f"cards is not an array ({type(raw_cards).__name__})")
     card_warns = []
     cards = normalize_cards(raw_cards if isinstance(raw_cards, list) else None, ids, card_warns)
     warns.extend(card_warns)
@@ -1929,7 +2586,7 @@ def cmd_selfcheck(args):
         dropped = sum(1 for x in raw_cards if isinstance(x, dict)) - len(cards)
         bad_items = sum(1 for x in raw_cards if not isinstance(x, dict))
         if bad_items or dropped > 0:
-            problems.append(f"cards 中有 {bad_items + max(dropped, 0)} 个条目非法（见 WARN）")
+            problems.append(f"cards has {bad_items + max(dropped, 0)} invalid entries (see WARN)")
     # 卡片证据与页面引用走同一道机检：伪页面 id 为 card:<id>
     ref_pages = list(pages) + [
         {"id": f"card:{c['id']}", "markdown": " ".join(f"`{k}`" for k in c["keyFiles"])}
@@ -1941,32 +2598,60 @@ def cmd_selfcheck(args):
         for p in problems:
             print(f"[dsh-wiki] FAIL {p}", file=sys.stderr)
         sys.exit(1)
-    extra = f" + {len(cards)} 张卡片" if cards else ""
-    print(f"[dsh-wiki] selfcheck 通过: {len(pages)} 页{extra}, 站点自包含、零外链")
+    extra = f" + {len(cards)} cards" if cards else ""
+    print(f"[dsh-wiki] selfcheck passed: {len(pages)} pages{extra}, site self-contained, zero external links")
 
 
 # ---------------------------------------------------------------- cli
 
 def main():
-    ap = argparse.ArgumentParser(prog="build_wiki_site.py", description="repo-wiki 纯本地构建器")
+    ap = argparse.ArgumentParser(prog="build_wiki_site.py", description="dsh-wiki local builder")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    b = sub.add_parser("build", help="由 wiki.json 构建自包含站点")
+    b = sub.add_parser("build", help="build a self-contained site from wiki.json")
     b.add_argument("--wiki", required=True)
-    im = sub.add_parser("import-legacy", help="导入旧版 repo-wiki 数据并构建")
+    im = sub.add_parser("import-legacy", help="import legacy repo-wiki data and build")
     im.add_argument("source")
     im.add_argument("--dest", default=None)
-    sc = sub.add_parser("selfcheck", help="树完整性 + 零外链 + 引用可解析性校验")
+    sc = sub.add_parser("selfcheck", help="tree integrity + zero external links + citation checks")
     sc.add_argument("--wiki", required=True)
-    asm = sub.add_parser("assemble", help="由 pages/*.md（+cards/*.md）front-matter 组装 wiki.json")
+    asm = sub.add_parser("assemble", help="assemble wiki.json from pages/*.md (+ cards/*.md) front-matter")
     asm.add_argument("--wiki", required=True)
-    asm.add_argument("--repo", default=None, help="写入 repoId（仓库绝对路径）")
+    asm.add_argument("--repo", default=None, help="set repoId (absolute repository path)")
     asm.add_argument("--title", default=None)
     asm.add_argument("--language", default=None)
-    rc = sub.add_parser("resolve-config", help="三层合并生成配置并落 generation-meta.json")
-    rc.add_argument("--repo", required=True, help="仓库路径")
+    rc = sub.add_parser("resolve-config", help="merge config layers and write generation-meta.json")
+    rc.add_argument("--repo", required=True, help="repository path")
     rc.add_argument("--set", action="append", default=[], metavar="K=V",
-                    help="覆盖字段，点路径寻址（可重复，如 --set language=zh-CN --set pages.max=24）")
-    rc.add_argument("--dry-run", action="store_true", help="只打印生效配置，不写文件")
+                    help="override a field by dotted path (repeatable, e.g. --set language=en --set pages.max=24)")
+    rc.add_argument("--dry-run", action="store_true", help="print the effective config only; write nothing")
+    di = sub.add_parser("diff-impact", help="map git-changed files to affected pages/cards (read-only JSON)")
+    di.add_argument("--wiki", required=True)
+    di.add_argument("--repo", default=None, help="repository path (default: repoId from wiki.json)")
+    di.add_argument("--from", dest="from_rev", default=None, metavar="COMMIT",
+                    help="base revision (default: sourceCommit from generation-meta.json/wiki.json)")
+    di.add_argument("--to", dest="to_rev", default=None, metavar="COMMIT", help="target revision (default: HEAD)")
+    ct = sub.add_parser("check-translation",
+                        help="verify a translated locale snapshot against the canonical English wiki (read-only)")
+    ct.add_argument("--canonical", required=True,
+                    help="canonical .dsh-wiki directory (English wiki.json)")
+    ct.add_argument("--translation", default=None,
+                    help="translated wiki directory, e.g. <canonical>/locales/vi")
+    ct.add_argument("--lang", default=None, metavar="TAG",
+                    help="locale tag; resolves --translation to <canonical>/locales/<tag>")
+    ct.add_argument("--meta", default=None,
+                    help="translation-meta.json (default: <translation>/translation-meta.json)")
+    ct.add_argument("--json", action="store_true",
+                    help="print the full machine report as JSON on stdout")
+    li = sub.add_parser("locales-init",
+                        help="create an empty translation skeleton under <canonical>/locales/<lang>/")
+    li.add_argument("--canonical", required=True,
+                    help="canonical .dsh-wiki directory (English wiki.json)")
+    li.add_argument("--lang", required=True, metavar="TAG",
+                    help="locale tag; destination is <canonical>/locales/<tag>")
+    li.add_argument("--force", action="store_true",
+                    help="replace an existing destination (restored if the final rename fails)")
+    li.add_argument("--json", action="store_true",
+                    help="print a machine summary object as JSON on stdout")
     args = ap.parse_args()
     try:
         if args.cmd == "build":
@@ -1979,8 +2664,14 @@ def main():
             cmd_assemble(args)
         elif args.cmd == "resolve-config":
             cmd_resolve(args)
+        elif args.cmd == "diff-impact":
+            cmd_diff_impact(args)
+        elif args.cmd == "check-translation":
+            cmd_check_translation(args)
+        elif args.cmd == "locales-init":
+            cmd_locales_init(args)
     except RecursionError:
-        sys.exit("[dsh-wiki] 输入嵌套过深（递归超限）：请降低 markdown 嵌套/页面树深度后重试")
+        sys.exit("[dsh-wiki] input nested too deeply (recursion limit): reduce markdown nesting / page-tree depth and retry")
 
 
 if __name__ == "__main__":
