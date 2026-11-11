@@ -11,6 +11,23 @@
   `UPSTREAM.md`），这三次的安全与健壮性修复是审计本仓库代码的前提。上游 v0.2.0、v0.2.1
   两个 tag 里没有 `CHANGELOG.md`，其条目是在 v0.2.2 时补写的。
 
+## 0.3.2 — 未发布（spec `specs/016-wiki-self-update`；修复一个让自更新永远无法成功的缺陷）
+
+- **缺陷**：对已发布的 `v0.3.1`（附注标签 annotated tag）做真实 git 演练，`apply()` 每次都返回
+  `postcondition-failed` 并恢复原修订。原因：对附注标签，`git rev-parse refs/tags/v<ver>` 给出的是
+  **标签对象** id，而 `git checkout --detach` 会把它剥离（peel）成提交；后置条件却拿 HEAD 去比较未剥离的 id，
+  于是永远不相等。
+- **修复**：`resolveTarget` 里的每个候选引用现在都带 `^{commit}` 剥离（`refs/tags/v<version>`、
+  `refs/tags/<version>`、`origin/main`）；其余一概未改。
+- **测试**：`tools/update-test.mjs` 145 → 150 项检查；测试用的 fake 现在会模拟附注标签；去掉剥离后
+  150 项里有 6 项失败。
+- **影响（直说）**：已发布的 0.3.1 **带有这个缺陷**——开启 `update.enabled: true` 的 0.3.1 安装无法通过面板
+  升到之后的任何版本（更新被以 `postcondition-failed` 拒绝，安装被恢复）。因此从 0.3.1 升到 0.3.2 需要手动执行
+  `git fetch --tags --prune origin` 加 `git checkout --detach v0.3.2`。
+- **此前已通过的演练结果**：人为制造不匹配时，真实的 fetch + checkout + 恢复路径可用，预先埋下的
+  `post-checkout` 钩子与 credential-helper 陷阱都没有触发。
+- **尚未验证**：还没有运行过一次成功的 apply；0.3.2 是它的第一次真实测试。
+
 ## 0.3.1 — 未发布（spec `specs/015-wiki-mcp-adapter`；同一个 wiki 也给 DSH 之外的 agent 用）
 
 spec 014 让 DSH 会话里的 agent 看到五个原生工具；本版把**同一批工具**交给 DSH 之外的 agent
@@ -154,7 +171,7 @@ wiki 从“人能看的站点”变成“agent 能查的知识库”：五个原
 
 ## 0.2.0 — 未发布
 
-知识卡片与生成体验（spec `specs/004-wiki-knowledge-cards`）。`wiki.json` schema 仍为 `repo-wiki-local/1`；无卡片的 wiki 构建输出与 0.1.x 逐字节一致（时间戳除外）。
+知识卡片与生成体验（spec `specs/004-wiki-knowledge-cards`，dsh-ext）。`wiki.json` schema 仍为 `repo-wiki-local/1`；无卡片的 wiki 构建输出与 0.1.x 逐字节一致（时间戳除外）。
 
 - 知识卡片：`wiki.json` 可选 `cards` 数组（`id/title/kind/summary/keyFiles/related/tags/pageIds`），构建器清洗与告警，>200 张告警；站点新增卡片网格（按类型/标签筛选）、单卡视图（关键文件、相关卡片、引用页面）、卡片进入全文搜索。
 - 页面链接 `[文本](#card-<id>)` 渲染为站内锚点；目标缺失降级为纯文本并告警。

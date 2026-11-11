@@ -160,10 +160,10 @@ const LANGS = { phase: "ready", tags: ["vi"], error: null };
 const infoGenerated = {
   root: ROOT, title: "dsh-wiki", generated: true, hasSite: true, dir: ".dsh-wiki/site",
   pageCount: 31, cardCount: 25, language: "en", sourceCommit: SOURCE_COMMIT,
-  updatedAt: UPDATED_AT, updateAvailable: true, head: HEAD, workspaceId: "local-workspace",
+  updatedAt: UPDATED_AT, updateAvailable: true, head: HEAD, workspaceId: "w-dsh-ext",
 };
 const infoMissing = {
-  root: ROOT, title: "workspace", generated: false, hasSite: false, dir: null,
+  root: ROOT, title: "dsh-ext", generated: false, hasSite: false, dir: null,
   pageCount: 0, cardCount: 0, language: "en", sourceCommit: null,
   updatedAt: null, updateAvailable: false, head: null, workspaceId: null,
 };
@@ -208,21 +208,21 @@ const PANELS = [
   {
     caption: "a · light · gate closed · update available",
     dark: false,
-    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "local-workspace" },
+    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "w-dsh-ext" },
     data: { phase: "ready", info: infoGenerated, wiki: WIKI, missing: false, error: null },
     jobView: { active: null, last: null, gate: CLOSED_GATE },
   },
   {
     caption: "b · dark · gate closed · update available",
     dark: true,
-    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "local-workspace" },
+    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "w-dsh-ext" },
     data: { phase: "ready", info: infoGenerated, wiki: WIKI, missing: false, error: null },
     jobView: { active: null, last: null, gate: CLOSED_GATE },
   },
   {
     caption: "c · light · gate open · update job running · More actions open",
     dark: false,
-    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "local-workspace" },
+    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "w-dsh-ext" },
     data: { phase: "ready", info: infoCurrent, wiki: WIKI, missing: false, error: null },
     jobView: { active: RUNNING_JOB, last: null, gate: OPEN_GATE },
     // 菜单展开：证明它挂在自己的按钮下面（right:0），并且「在会话中…」真的在菜单里
@@ -231,7 +231,7 @@ const PANELS = [
   {
     caption: "d · light · gate open · project not generated yet",
     dark: false,
-    project: { root: ROOT, title: "workspace", generated: false, workspaceId: null },
+    project: { root: ROOT, title: "dsh-ext", generated: false, workspaceId: null },
     data: { phase: "ready", info: infoMissing, wiki: null, missing: false, error: null },
     jobView: { active: null, last: null, gate: OPEN_GATE },
   },
@@ -241,7 +241,7 @@ const PANELS = [
     caption: "e · light · 460px panel · gate closed · update available (narrow case)",
     width: 460,
     dark: false,
-    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "local-workspace" },
+    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "w-dsh-ext" },
     data: { phase: "ready", info: infoGenerated, wiki: WIKI, missing: false, error: null },
     jobView: { active: null, last: null, gate: CLOSED_GATE },
   },
@@ -249,7 +249,7 @@ const PANELS = [
     caption: "f · dark · 464px panel · gate closed · update available (narrow case)",
     width: 464,
     dark: true,
-    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "local-workspace" },
+    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "w-dsh-ext" },
     data: { phase: "ready", info: infoGenerated, wiki: WIKI, missing: false, error: null },
     jobView: { active: null, last: null, gate: CLOSED_GATE },
   },
@@ -260,7 +260,7 @@ const PANELS = [
   {
     caption: "g · light · gate closed · project not generated yet",
     dark: false,
-    project: { root: ROOT, title: "workspace", generated: false, workspaceId: null },
+    project: { root: ROOT, title: "dsh-ext", generated: false, workspaceId: null },
     data: { phase: "ready", info: infoMissing, wiki: null, missing: false, error: null },
     jobView: { active: null, last: null, gate: CLOSED_GATE },
   },
@@ -269,7 +269,7 @@ const PANELS = [
   {
     caption: "h · light · gate open · incremental update running (affected pages/cards)",
     dark: false,
-    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "local-workspace" },
+    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "w-dsh-ext" },
     data: { phase: "ready", info: infoCurrent, wiki: WIKI, missing: false, error: null },
     jobView: { active: INCREMENTAL_RUNNING_JOB, last: null, gate: OPEN_GATE },
   },
@@ -278,7 +278,7 @@ const PANELS = [
   {
     caption: "i · dark · gate open · incremental update finished (rewritten pages + uncovered changed files)",
     dark: true,
-    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "local-workspace" },
+    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "w-dsh-ext" },
     data: { phase: "ready", info: infoGenerated, wiki: WIKI, missing: false, error: null },
     jobView: { active: null, last: INCREMENTAL_DONE_JOB, gate: OPEN_GATE },
   },
@@ -287,7 +287,7 @@ const PANELS = [
   {
     caption: "j · light · gate open · incremental update finished, removed a page",
     dark: false,
-    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "local-workspace" },
+    project: { root: ROOT, title: "dsh-wiki", generated: true, workspaceId: "w-dsh-ext" },
     data: { phase: "ready", info: infoGenerated, wiki: WIKI, missing: false, error: null },
     jobView: { active: null, last: INCREMENTAL_REMOVED_JOB, gate: OPEN_GATE },
   },

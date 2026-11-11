@@ -3120,7 +3120,7 @@ const collectStrings = (value, out = []) => {  if (typeof value === "string") ou
   // 两条路径都是**合成**的：当前盘根 + 通用段，不嵌入任何真实机器路径或用户名 —— 否则测试
   // 自己就会把一台机器的路径写进公开仓库。
   const EXEC_LEAK_USER = "someone";
-  const execLeakRoot = path.resolve(path.parse(process.cwd()).root, "Users", EXEC_LEAK_USER, "Documents", "example-repo");
+  const execLeakRoot = path.resolve(path.parse(process.cwd()).root, "Users", EXEC_LEAK_USER, "Documents", "dsh-ext");
   const execLeakPosix = path.posix.join("/", "home", EXEC_LEAK_USER);
   const execLeakMessage = `EACCES: permission denied, open '${path.posix.join(execLeakPosix, "dsh-wiki", "journal", "record.json")}'`;
   execProbe.result = {

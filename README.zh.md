@@ -435,7 +435,7 @@ git fetch --tags --prune origin
 git checkout --detach v<version>   # or the tag <version>, or origin/main when no tag exists
 ```
 
-然后重载插件。配置键：`update.enabled`（布尔，默认 `false`；它是 `update` 下唯一的键，多出的键是配置错误）。
+然后重载插件。0.3.1 的安装无法通过面板自更新：0.3.1 存在附注标签（annotated tag）缺陷（后置条件把 HEAD 与未剥离的标签对象 id 比较，导致每次更新都以 `postcondition-failed` 被拒并恢复），已在 0.3.2 修复；从 0.3.1 升到 0.3.2 请用本节的手动等价操作（`v0.3.2`）。配置键：`update.enabled`（布尔，默认 `false`；它是 `update` 下唯一的键，多出的键是配置错误）。
 已知限制：检出/恢复路径目前只对注入的假实现验证过，没有对真实仓库执行过。
 
 ## ⚔️ 与社区同类方案对比
@@ -515,7 +515,7 @@ node tools/fs-contain-test.mjs          # 27 containment checks (canonical dir, 
 node tools/worker-guard-test.mjs        # 61 worker tool-guard checks
 node tools/host-liveness-test.mjs       # 26 host-liveness checks
 node tools/readme-parity-test.mjs       # 127 README parity checks (heading skeleton, byte-identical code blocks, fact tokens, links and anchors, line ratio, no machine paths — across every README translation)
-node tools/update-test.mjs              # 145 update checks (version check + safe self-update: enabled gate, symlink/dirty-tree/origin refusals, downgrade guard, no path or upstream text in payloads, never restarts, single-flight, hardened git config)
+node tools/update-test.mjs              # 150 update checks (version check + safe self-update: enabled gate, symlink/dirty-tree/origin refusals, downgrade guard, no path or upstream text in payloads, never restarts, single-flight, hardened git config)
 node tools/update-ui-test.mjs <react> <react-dom> # 72 update UI checks (the Version card in every state rendered with real React; requests only on user action; install success only reports a reload)
 node tools/wiki-freshness-test.mjs      # 39 wiki-freshness checks (changedFiles excludes the wiki dir via git pathspec, stale/behind/unknown semantics, injected fake execFile — no git, no network)
 node tools/recovery-code-projection-test.mjs # 18 recovery-code projection checks (route PLAN_CODES / releaseReason allowlists re-derived from the producers, drift in either direction fails, fail-closed fallback kept)

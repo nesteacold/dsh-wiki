@@ -1,6 +1,6 @@
 {
   "name": "@dsh-ext/dsh-wiki",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Local Repo Wiki (DeepWiki-style): the agent reads a repository locally and writes a paged, evidence-cited wiki (page tree + diagrams + knowledge cards), built into a single self-contained site and browsable natively in DSH. Nothing uploaded, zero network.",
   "type": "module",
   "main": "lib/index.js",

@@ -210,7 +210,7 @@ const fakeGit = (overrides = {}) => {
   const state = {
     clean: true, workTree: true, statusOk: true,
     origin: `https://github.com/${EXPECTED_ORIGIN}.git`,
-    head: HEAD_A, branchSha: HEAD_B, tags: {}, fetchOk: true, failCheckoutOf: null,
+    head: HEAD_A, branchSha: HEAD_B, tags: {}, annotated: {}, fetchOk: true, failCheckoutOf: null,
     topLevel: null, topLevelOk: true,
     delayMs: 0, install: null, versions: null,
     ...overrides,
@@ -242,8 +242,17 @@ const fakeGit = (overrides = {}) => {
     if (first === "rev-parse" && second === "HEAD") return { ok: true, stdout: `${currentHead}\n`, stderr: "" };
     if (first === "fetch") return { ok: state.fetchOk, stdout: "", stderr: "" };
     if (first === "rev-parse" && second === "--verify") {
-      // `git rev-parse --verify --quiet <ref>`: the ref is the fourth argument, not the third.
-      const ref = gitArgs(argv)[3];
+      // `git rev-parse --verify --quiet <ref>[^{commit}]`: the ref is the fourth argument, not the third.
+      // Like real git, the bare form of an ANNOTATED tag answers the tag OBJECT id (`annotated` maps a tag
+      // ref to { object, commit }); the `^{commit}` form peels it. Lightweight tags and branches answer
+      // the same id for both forms.
+      const raw = gitArgs(argv)[3];
+      const peeled = raw.endsWith("^{commit}");
+      const ref = peeled ? raw.slice(0, -"^{commit}".length) : raw;
+      if (Object.hasOwn(state.annotated, ref)) {
+        const tag = state.annotated[ref];
+        return { ok: true, stdout: `${peeled ? tag.commit : tag.object}\n`, stderr: "" };
+      }
       if (Object.hasOwn(state.tags, ref)) return { ok: true, stdout: `${state.tags[ref]}\n`, stderr: "" };
       if (ref === "origin/main" && state.branchSha) return { ok: true, stdout: `${state.branchSha}\n`, stderr: "" };
       return { ok: false, stdout: "", stderr: "" };
@@ -251,9 +260,12 @@ const fakeGit = (overrides = {}) => {
     if (first === "checkout" && second === "--detach") {
       // Only the named revision fails, so a restore checkout can still succeed (checkout-failed path).
       if (state.failCheckoutOf === third) return { ok: false, stdout: "", stderr: "" };
-      currentHead = third;
-      if (state.install && state.versions && Object.hasOwn(state.versions, third)) {
-        writeVersion(state.install, state.versions[third]);
+      // Real git peels an annotated tag object to its commit, so HEAD lands on the COMMIT whichever of the
+      // two ids was named.
+      const tagObject = Object.values(state.annotated).find((tag) => tag.object === third);
+      currentHead = tagObject ? tagObject.commit : third;
+      if (state.install && state.versions && Object.hasOwn(state.versions, currentHead)) {
+        writeVersion(state.install, state.versions[currentHead]);
       }
       return { ok: true, stdout: "", stderr: "" };
     }
@@ -705,7 +717,7 @@ check("status: latest carries the pinned source and the injected clock, canUpdat
   && successStatus.reason === null, JSON.stringify(successStatus));
 check("apply performs the contracted sequence and leaves HEAD at the resolved target",
   hasGit(success.git.calls, "fetch --tags --prune origin")
-  && hasGit(success.git.calls, "rev-parse --verify --quiet origin/main")
+  && hasGit(success.git.calls, "rev-parse --verify --quiet origin/main^{commit}")
   && hasGit(success.git.calls, `checkout --detach ${HEAD_B}`)
   && success.git.head() === HEAD_B, JSON.stringify(gitLines(success.git.calls)));
 
@@ -722,12 +734,59 @@ const taggedResult = await serviceFor(taggedInstall, {
   fetchImpl: fakeFetch({ body: JSON.stringify({ version: "0.4.0" }) }), gitRunner: taggedGit.runner }).apply();
 check("a matching tag is preferred over the branch (§7)",
   taggedResult.ok === true && taggedGit.head() === HEAD_C
-  && hasGit(taggedGit.calls, "rev-parse --verify --quiet refs/tags/v0.4.0")
-  && !hasGit(taggedGit.calls, "rev-parse --verify --quiet refs/tags/0.4.0")
-  && !hasGit(taggedGit.calls, "rev-parse --verify --quiet origin/main"),
+  && hasGit(taggedGit.calls, "rev-parse --verify --quiet refs/tags/v0.4.0^{commit}")
+  && !hasGit(taggedGit.calls, "rev-parse --verify --quiet refs/tags/0.4.0^{commit}")
+  && !hasGit(taggedGit.calls, "rev-parse --verify --quiet origin/main^{commit}"),
   JSON.stringify(gitLines(taggedGit.calls)));
 check("a successful apply leaves the installed version on disk equal to the published one",
   readInstalledOnDisk(taggedInstall) === "0.4.0", readInstalledOnDisk(taggedInstall));
+
+// An ANNOTATED tag: the bare `rev-parse <tag>` answers the tag OBJECT id, the `^{commit}` form answers the
+// commit, and `checkout --detach` leaves HEAD on the COMMIT whichever id it was given (as real git does).
+// Without the peel the postcondition compares HEAD (commit) to the tag object and fails.
+const TAG_OBJECT = "e".repeat(40);
+const annotatedInstall = makeInstall({ version: "0.3.0" });
+const annotatedGit = fakeGit({
+  install: annotatedInstall,
+  versions: { [HEAD_A]: "0.3.0", [HEAD_B]: "0.4.0", [HEAD_C]: "0.4.0" },
+  annotated: { "refs/tags/v0.4.0": { object: TAG_OBJECT, commit: HEAD_C } },
+  branchSha: HEAD_B,
+});
+const annotatedResult = await serviceFor(annotatedInstall, {
+  fetchImpl: fakeFetch({ body: JSON.stringify({ version: "0.4.0" }) }), gitRunner: annotatedGit.runner }).apply();
+check("an annotated tag applies: ok, applied, reloadRequired (the tag object id is never the target)",
+  annotatedResult.ok === true && annotatedResult.applied === true && annotatedResult.reloadRequired === true
+  && annotatedGit.head() === HEAD_C, JSON.stringify({ annotatedResult, calls: gitLines(annotatedGit.calls) }));
+check("an annotated tag is checked out by its COMMIT id, not the tag object id",
+  JSON.stringify(checkoutTargets(annotatedGit.calls)) === JSON.stringify([HEAD_C]),
+  JSON.stringify(checkoutTargets(annotatedGit.calls)));
+
+// A lightweight tag (peeled and unpeeled ids are the same) and the origin/main fallback still succeed.
+const lightInstall = makeInstall({ version: "0.3.0" });
+const lightGit = fakeGit({
+  install: lightInstall,
+  versions: { [HEAD_A]: "0.3.0", [HEAD_B]: "0.4.0", [HEAD_C]: "0.4.0" },
+  tags: { "refs/tags/v0.4.0": HEAD_C },
+});
+const lightResult = await serviceFor(lightInstall, {
+  fetchImpl: fakeFetch({ body: JSON.stringify({ version: "0.4.0" }) }), gitRunner: lightGit.runner }).apply();
+check("a lightweight tag still applies and is checked out by the same id",
+  lightResult.ok === true && lightResult.applied === true
+  && JSON.stringify(checkoutTargets(lightGit.calls)) === JSON.stringify([HEAD_C]),
+  JSON.stringify({ lightResult, checkouts: checkoutTargets(lightGit.calls) }));
+check("the origin/main fallback still applies through the peeled form",
+  successResult.ok === true && success.git.head() === HEAD_B
+  && JSON.stringify(checkoutTargets(success.git.calls)) === JSON.stringify([HEAD_B]),
+  JSON.stringify(gitLines(success.git.calls)));
+
+// Every rev-parse --verify resolveTarget issues must carry the ^{commit} peel, so a refactor cannot drop it.
+const verifyArgs = [annotatedGit, lightGit, success.git, taggedGit].flatMap((git) => git.calls
+  .map((call) => gitArgs(call.argv))
+  .filter((args) => args[0] === "rev-parse" && args[1] === "--verify")
+  .map((args) => args.join(" ")));
+check("every rev-parse --verify issued by resolveTarget uses the ^{commit} form",
+  verifyArgs.length >= 4 && verifyArgs.every((line) => /^rev-parse --verify --quiet \S+\^\{commit\}$/.test(line)),
+  JSON.stringify(verifyArgs));
 
 /** The version a real install would now report, read from the fixture. */
 function readInstalledOnDisk(install) {
@@ -1042,8 +1101,8 @@ check("no git call is a shell string and no ambient token is forwarded to the ch
   JSON.stringify(surface.git.calls[0]?.options?.env));
 check("the git operations are exactly the contracted argv arrays",
   ["rev-parse --is-inside-work-tree", "rev-parse --show-toplevel", "remote get-url origin", "status --porcelain",
-    "rev-parse HEAD", "fetch --tags --prune origin", "rev-parse --verify --quiet refs/tags/v0.4.0",
-    "rev-parse --verify --quiet refs/tags/0.4.0", "rev-parse --verify --quiet origin/main",
+    "rev-parse HEAD", "fetch --tags --prune origin", "rev-parse --verify --quiet refs/tags/v0.4.0^{commit}",
+    "rev-parse --verify --quiet refs/tags/0.4.0^{commit}", "rev-parse --verify --quiet origin/main^{commit}",
     `checkout --detach ${HEAD_B}`].every((command) => hasGit(surface.git.calls, command)),
   JSON.stringify(gitLines(surface.git.calls)));
 

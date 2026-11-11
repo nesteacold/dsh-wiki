@@ -91,20 +91,20 @@ BOM，算出来的哈希对不上；一律用 `git cat-file` 重定向到文件�
    的基线段（tag、commit、两个 sha256）并在 `CHANGELOG.md` 记一条。
 5. 基线变化视为审阅事件：构建器改动不与其它功能提交混在一起。
 
-## 第二上游：Acfufu/dsh-wiki（本仓库导入）
+## 第二上游：Acfufu/dsh-wiki（dsh-ext 导入）
 
 | 项 | 值 |
 |---|---|
 | 仓库 | `https://github.com/Acfufu/dsh-wiki` |
 | commit | `9f9e8428119b21e6416862a67b5c96420191a265` |
 | 导入方式 | `git subtree add --prefix=plugins/dsh-wiki <dsh-wiki> main`（保留历史，不 squash），2026-11-08 |
-| 本仓库内命名 | 目录 `plugins/dsh-wiki`，包名 `@dsh-ext/dsh-wiki`（`package.json` 与 `cordis.patch.yml` 的 `name` 一致，loader 要求）；运行时 id `dsh-wiki`、路由 `/dsh-wiki`、默认目录 `.dsh-wiki` 与包名现已一致，无需改动即兼容已生成的 wiki（owner 决定 2026-11-08；曾短暂命名为 `repo-wiki`，见 specs/003-repo-wiki-baseline） |
+| dsh-ext 内命名 | 目录 `plugins/dsh-wiki`，包名 `@dsh-ext/dsh-wiki`（`package.json` 与 `cordis.patch.yml` 的 `name` 一致，loader 要求）；运行时 id `dsh-wiki`、路由 `/dsh-wiki`、默认目录 `.dsh-wiki` 与包名现已一致，无需改动即兼容已生成的 wiki（owner 决定 2026-11-08；曾短暂命名为 `repo-wiki`，见 specs/003-repo-wiki-baseline） |
 
-拉取上游更新（在本仓库根目录）：
+拉取上游更新（在 dsh-ext 根目录）：
 
 ```bash
 git subtree pull --prefix=plugins/dsh-wiki https://github.com/Acfufu/dsh-wiki main
-# 冲突常见于 package.json 的 name 与已移到根 .github/workflows/dsh-wiki.yml 的 CI；按本节保留本仓库侧。
+# 冲突常见于 package.json 的 name 与已移到根 .github/workflows/dsh-wiki.yml 的 CI；按本节保留 dsh-ext 侧。
 ```
 
 ## 许可

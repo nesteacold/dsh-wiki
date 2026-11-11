@@ -9,9 +9,9 @@
 //
 // WHY --repo IS LOAD-BEARING (measured 2026-11-11 on this machine)
 //   The adapter resolves an omitted `repo` from the DSH registry (`~/.dsh/dsh-wiki/registry.json`).
-//   That registry held 8 roots and TWO of them carried a wiki, so an unqualified call answers
-//   `repo-ambiguous` instead of guessing. This script therefore always passes `--repo <abs>` when
-//   it can prove a single wiki, and refuses (exit 2) when it cannot.
+//   That registry held 8 roots and TWO of them carried a wiki,
+//   so an unqualified call answers `repo-ambiguous` instead of guessing. This script therefore always
+//   passes `--repo <abs>` when it can prove a single wiki, and refuses (exit 2) when it cannot.
 //
 // SAFETY
 //   * Default mode is DRY RUN: it prints what it would do and changes nothing.

@@ -191,11 +191,10 @@ node tools/register-mcp.mjs --uninstall --apply
 ```
 
 **`--repo` is load-bearing, measured on this machine.** The adapter resolves an omitted `repo` from
-the DSH registry (`~/.dsh/dsh-wiki/registry.json`); that registry held 8 roots and **two** of them
-carried a wiki, so an unqualified call answers `repo-ambiguous` rather than guessing. The installer
-therefore always pins `--repo <abs>` when it can prove exactly one wiki, and exits 2 with the
-candidate list when it cannot. Pass `--repo` yourself when running from outside a wiki-bearing
-directory.
+the DSH registry (`~/.dsh/dsh-wiki/registry.json`); that registry held 8 roots and **two** carried a
+wiki, so an unqualified call answers `repo-ambiguous` rather than guessing. The installer therefore always pins `--repo <abs>` when it can prove exactly one wiki,
+and exits 2 with the candidate list when it cannot. Pass `--repo` yourself when running from outside
+a wiki-bearing directory.
 
 What was actually verified here, and what was not:
 
@@ -527,7 +526,7 @@ git fetch --tags --prune origin
 git checkout --detach v<version>   # or the tag <version>, or origin/main when no tag exists
 ```
 
-then reload the plugin. Configuration key: `update.enabled` (boolean, default `false`; it is the only `update`
+then reload the plugin. An install of 0.3.1 cannot update itself through the panel: 0.3.1 has an annotated-tag defect (the postcondition compared HEAD with the unpeeled tag-object id, so every update was refused with `postcondition-failed` and restored), fixed in 0.3.2. To go from 0.3.1 to 0.3.2, use this manual equivalent with `v0.3.2`. Configuration key: `update.enabled` (boolean, default `false`; it is the only `update`
 key and any other key is a configuration error). Known limit: the checkout/restore path has so far been verified
 against injected fakes, not against a real repository.
 
@@ -600,7 +599,7 @@ node tools/fs-contain-test.mjs          # 27 containment checks (canonical dir, 
 node tools/worker-guard-test.mjs        # 61 worker tool-guard checks
 node tools/host-liveness-test.mjs       # 26 host-liveness checks
 node tools/readme-parity-test.mjs       # 127 README parity checks (heading skeleton, byte-identical code blocks, fact tokens, links and anchors, line ratio, no machine paths — across every README translation)
-node tools/update-test.mjs              # 145 update checks (version check + safe self-update: enabled gate, symlink/dirty-tree/origin refusals, downgrade guard, no path or upstream text in payloads, never restarts, single-flight, hardened git config)
+node tools/update-test.mjs              # 150 update checks (version check + safe self-update: enabled gate, symlink/dirty-tree/origin refusals, downgrade guard, no path or upstream text in payloads, never restarts, single-flight, hardened git config)
 node tools/update-ui-test.mjs <react> <react-dom> # 72 update UI checks (the Version card in every state rendered with real React; requests only on user action; install success only reports a reload)
 node tools/wiki-freshness-test.mjs      # 39 wiki-freshness checks (changedFiles excludes the wiki dir via git pathspec, stale/behind/unknown semantics, injected fake execFile — no git, no network)
 node tools/recovery-code-projection-test.mjs # 18 recovery-code projection checks (route PLAN_CODES / releaseReason allowlists re-derived from the producers, drift in either direction fails, fail-closed fallback kept)

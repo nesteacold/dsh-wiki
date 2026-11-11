@@ -534,7 +534,7 @@ git fetch --tags --prune origin
 git checkout --detach v<version>   # or the tag <version>, or origin/main when no tag exists
 ```
 
-rồi reload plugin. Khoá cấu hình: `update.enabled` (boolean, mặc định `false`; đó là khoá `update` duy nhất và
+rồi reload plugin. Một bản cài 0.3.1 không thể tự cập nhật qua panel: 0.3.1 có lỗi với annotated tag (postcondition so sánh HEAD với id của tag object chưa được peel, nên mọi lần cập nhật đều bị từ chối với `postcondition-failed` rồi được khôi phục), đã sửa ở 0.3.2. Để đi từ 0.3.1 lên 0.3.2, hãy dùng cách làm thủ công tương đương này với `v0.3.2`. Khoá cấu hình: `update.enabled` (boolean, mặc định `false`; đó là khoá `update` duy nhất và
 mọi khoá khác là lỗi cấu hình). Giới hạn đã biết: đường checkout/restore cho tới nay mới được xác minh với các
 bản giả được tiêm vào, chưa với một repository thật.
 
@@ -622,7 +622,7 @@ node tools/fs-contain-test.mjs          # 27 containment checks (canonical dir, 
 node tools/worker-guard-test.mjs        # 61 worker tool-guard checks
 node tools/host-liveness-test.mjs       # 26 host-liveness checks
 node tools/readme-parity-test.mjs       # 127 README parity checks (heading skeleton, byte-identical code blocks, fact tokens, links and anchors, line ratio, no machine paths — across every README translation)
-node tools/update-test.mjs              # 145 update checks (version check + safe self-update: enabled gate, symlink/dirty-tree/origin refusals, downgrade guard, no path or upstream text in payloads, never restarts, single-flight, hardened git config)
+node tools/update-test.mjs              # 150 update checks (version check + safe self-update: enabled gate, symlink/dirty-tree/origin refusals, downgrade guard, no path or upstream text in payloads, never restarts, single-flight, hardened git config)
 node tools/update-ui-test.mjs <react> <react-dom> # 72 update UI checks (the Version card in every state rendered with real React; requests only on user action; install success only reports a reload)
 node tools/wiki-freshness-test.mjs      # 39 wiki-freshness checks (changedFiles excludes the wiki dir via git pathspec, stale/behind/unknown semantics, injected fake execFile — no git, no network)
 node tools/recovery-code-projection-test.mjs # 18 recovery-code projection checks (route PLAN_CODES / releaseReason allowlists re-derived from the producers, drift in either direction fails, fail-closed fallback kept)
