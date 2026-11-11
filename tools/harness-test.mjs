@@ -2914,8 +2914,12 @@ const collectStrings = (value, out = []) => {  if (typeof value === "string") ou
     `${execNoRecord.status} ${execNoRecord.body.slice(0, 240)}`);
 
   // (l) 管理器结果里的原始绝对路径（Windows 与 fs 风格各一条）绝不进入响应体。
-  const execLeakRoot = "C:\\Users\\neste\\Documents\\DSH_Project\\dsh-ext";
-  const execLeakMessage = "EACCES: permission denied, open '/home/neste/dsh-wiki/journal/record.json'";
+  // 两条路径都是**合成**的：当前盘根 + 通用段，不嵌入任何真实机器路径或用户名 —— 否则测试
+  // 自己就会把一台机器的路径写进公开仓库。
+  const EXEC_LEAK_USER = "someone";
+  const execLeakRoot = path.resolve(path.parse(process.cwd()).root, "Users", EXEC_LEAK_USER, "Documents", "dsh-ext");
+  const execLeakPosix = path.posix.join("/", "home", EXEC_LEAK_USER);
+  const execLeakMessage = `EACCES: permission denied, open '${path.posix.join(execLeakPosix, "dsh-wiki", "journal", "record.json")}'`;
   execProbe.result = {
     status: "planned", root: execLeakRoot, message: execLeakMessage,
     executed: false, effects: 0, released: false, releaseReason: null,
@@ -2924,7 +2928,7 @@ const collectStrings = (value, out = []) => {  if (typeof value === "string") ou
   check("recovery-execute: absolute paths in the manager result never reach the response body",
     execLeak.status === 200
     && !execLeak.body.includes(execLeakRoot) && !execLeak.body.includes(execLeakMessage)
-    && !execLeak.body.includes("Users") && !execLeak.body.includes("/home/neste")
+    && !execLeak.body.includes("Users") && !execLeak.body.includes(execLeakPosix)
     && !execLeak.body.includes("EACCES") && !/[A-Za-z]:[\\/]/.test(execLeak.body),
     `${execLeak.status} ${execLeak.body.slice(0, 240)}`);
 

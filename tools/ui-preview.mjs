@@ -3,8 +3,10 @@
 // 其中 h/i/j 三格是 spec 013 的增量作业：进行中显示受影响页/卡，完成行显示重写页数与未映射文件，
 // j 另外显示“删除 1 页”（被删的页必须看得见，不能静静地消失）。
 // 用法：
-//   node tools/ui-preview.mjs [输出路径]
+//   node tools/ui-preview.mjs [输出路径] [react 目录] [react-dom 目录]
 // 默认写到 %TEMP%\dsh-wiki-ui-preview.html。不联网、不开服务、不启动浏览器：写一个文件就退出 0。
+// 路径全部由本文件位置推导；React 只在包内 node_modules 或 monorepo 的 apps/mobile-companion 里找，
+// 找不到就报错退出 1 并提示怎么用参数/环境变量传入（见 USAGE）。
 //
 // React 取自与 tools/client-smoke.mjs 相同的 node_modules（apps/mobile-companion），
 // 组件用同一套手写 hook 层渲染（renderToStaticMarkup 不跑 effect，状态槽位由本脚本预置）。
@@ -14,10 +16,58 @@ import os from "node:os";
 import { createRequire } from "node:module";
 import vm from "node:vm";
 
-const DEFAULT_REACT = "C:\\Users\\neste\\Documents\\DSH_Project\\dsh-ext\\apps\\mobile-companion\\node_modules\\react";
-const DEFAULT_REACT_DOM = "C:\\Users\\neste\\Documents\\DSH_Project\\dsh-ext\\apps\\mobile-companion\\node_modules\\react-dom";
-const reactDir = process.env.DSH_WIKI_REACT || DEFAULT_REACT;
-const domDir = process.env.DSH_WIKI_REACT_DOM || DEFAULT_REACT_DOM;
+// ---------- 路径：全部从本文件位置推导，不写死某一台机器的绝对路径 ----------
+// 本文件在 <package>/tools/，所以包根是上一级。
+const ROOT = path.resolve(import.meta.dirname, "..");
+
+// React 不随本包发布，只有候选位置：独立仓库用包内 node_modules，当前 monorepo 用
+// apps/mobile-companion/node_modules。候选都不存在时必须明确失败并告诉调用者怎么传路径，
+// 绝不静默退回一个用不了的目录。
+const NODE_MODULES_CANDIDATES = [
+  path.join(ROOT, "node_modules"),
+  path.resolve(ROOT, "..", "..", "apps", "mobile-companion", "node_modules"),
+];
+const USAGE = [
+  "  node tools/ui-preview.mjs <out.html> <react-dir> <react-dom-dir>",
+  "  DSH_WIKI_REACT=<react-dir> DSH_WIKI_REACT_DOM=<react-dom-dir> node tools/ui-preview.mjs [out.html]",
+].join("\n");
+
+function fail(message) {
+  process.stderr.write(message + "\n");
+  process.exit(1);
+}
+
+function isPackageDir(dir, name) {
+  if (!dir) return false;
+  try {
+    return JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8"))?.name === name;
+  } catch {
+    return false;
+  }
+}
+
+// 优先级：CLI 参数 > 环境变量 > 候选目录。显式给了却不是那个包，也算明确失败。
+function resolvePackage(name, label, explicit, envName) {
+  const fromEnv = process.env[envName] || "";
+  const asked = explicit || fromEnv;
+  if (asked) {
+    if (isPackageDir(asked, name)) return asked;
+    fail("dsh-wiki: " + (explicit ? "the CLI directory" : envName) + " for " + label
+      + " is not a \"" + name + "\" package directory:\n  " + asked + "\n" + USAGE);
+  }
+  const tried = [];
+  for (const base of NODE_MODULES_CANDIDATES) {
+    const dir = path.join(base, name);
+    tried.push(dir);
+    if (isPackageDir(dir, name)) return dir;
+  }
+  fail("dsh-wiki: cannot find " + label + " (\"" + name + "\") to render the preview.\n"
+    + "  tried:\n" + tried.map((dir) => "    " + dir).join("\n") + "\n"
+    + "  This package does not vendor React; pass an existing install explicitly:\n" + USAGE);
+}
+
+const reactDir = resolvePackage("react", "React", process.argv[3], "DSH_WIKI_REACT");
+const domDir = resolvePackage("react-dom", "React DOM", process.argv[4], "DSH_WIKI_REACT_DOM");
 
 const req = createRequire(path.join(reactDir, "package.json"));
 const React = req(reactDir);
@@ -68,7 +118,6 @@ function loadClient(react) {
 }
 
 // ---------- fixture ----------
-const ROOT = "C:\\Users\\neste\\Documents\\DSH_Project\\dsh-ext\\plugins\\dsh-wiki";
 const UPDATED_AT = "2026-11-10T11:22:11.000Z";
 const SOURCE_COMMIT = "dd02d64f5b0c9a71c2e4d8f3a6b1c9e2d4f60a17";
 const HEAD = "a4ce6ba8e1f7c3d29b6a5e4d8c1f0b7a2e9d3c46";

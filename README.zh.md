@@ -33,17 +33,17 @@
 >
 > ```sh
 > # 本仓库是维护分支（fork），请从它安装
-> REPO="<你的 dsh-ext 检出路径>"
+> REPO="<本仓库的检出路径>"
 > CLI="<DSH 安装路径>/runtime/cli/bin/dsh"        # 例如 "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
 >                                                 # 或   "C:\Users\<you>\AppData\Local\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh"
-> "$CLI" plugin --profile desktop add "$REPO/plugins/dsh-wiki"
+> "$CLI" plugin --profile desktop add "$REPO"
 > ```
 
 ## ✨ 这是什么
 
 一个 DSH 插件，在这里以 **`@dsh-ext/dsh-wiki`** 维护——它是
-[`Acfufu/dsh-wiki`](https://github.com/Acfufu/dsh-wiki) 的 **fork**，可靠性与流水线、翻译方面的改动记录在
-[`specs/007-wiki-pipeline-i18n-models`](../../specs/007-wiki-pipeline-i18n-models)。运行期 id 是 `dsh-wiki`，
+[`Acfufu/dsh-wiki`](https://github.com/Acfufu/dsh-wiki) 的 **fork**，可靠性与流水线、翻译方面的改动记录在本仓库的 [`CHANGELOG.md`](CHANGELOG.md) 与提交历史里
+（编号 spec 与 `docs/arch-notes/` 留在私有开发树中）。运行期 id 是 `dsh-wiki`，
 包名因此保留该后缀。装进任意 web/desktop profile 后给你四样东西：
 
 | 入口 | 形式 | 说明 |
@@ -66,14 +66,14 @@
 
 前置：DSH Desktop 或 web profile（`dsh-base` + `dsh-web-app`）、`python3 ≥ 3.7`（构建器纯标准库，无第三方依赖）。
 
-**路线 A · GUI 插件页**：侧栏「插件」→ 添加插件 → 填本仓库的插件路径（`<repo>/plugins/dsh-wiki`）→ 安装 → 启用。
+**路线 A · GUI 插件页**：侧栏「插件」→ 添加插件 → 填本仓库的检出路径（含 `package.json` 的那一层）→ 安装 → 启用。
 
 **路线 B · CLI**：
 
 ```sh
 CLI="<DSH 安装路径>/runtime/cli/bin/dsh"
-REPO="<你的 dsh-ext 检出路径>"
-"$CLI" plugin --profile desktop add "$REPO/plugins/dsh-wiki"
+REPO="<本仓库的检出路径>"
+"$CLI" plugin --profile desktop add "$REPO"
 "$CLI" plugin --profile desktop list
 ```
 
@@ -165,7 +165,7 @@ MIT —— 见 [LICENSE](LICENSE)。构建器与查看器源自 [zcode-repo-wiki
 - 带可信恢复日志的"两段 rename"发布路径（`lib/journal*.js`、`lib/publish-executor.js`、`lib/fs-contain.js`）
 - 把 worker 的 `write`/`edit` 限制在 `staging/pages|cards/*.md` 的工具闸门（`lib/worker-guard.js`）
 - 以英文为 canonical、按单元翻译并用结构 SHA-256 校验的多语言支持（`locales/<lang>/`、`scripts/wiki_translations.py`）
-- 被跟踪的工作项、决策与未解决风险：[`specs/007-wiki-pipeline-i18n-models`](../../specs/007-wiki-pipeline-i18n-models)
-  与 [`docs/arch-notes/`](../../docs/arch-notes)
+- 被跟踪的工作项、决策与未解决风险：本仓库的 [`CHANGELOG.md`](CHANGELOG.md) 与提交历史
+  （编号 spec 与 `docs/arch-notes/` 留在私有开发树中）
 
 此处的包名是 `@dsh-ext/dsh-wiki`；`dsh-wiki` 只是运行期 id。若需要未改动的原版，请从上游仓库安装。

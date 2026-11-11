@@ -32,18 +32,19 @@
 > Among 9,100+ community plugins on awesome-dsh-plugin, none delivers a true DeepWiki-shaped artifact: dsh-openwiki wraps an external CLI and is unmaintained; codemap has citations but no prose; archify has diagrams but no wiki text. dsh-wiki combines **narrative pages + machine-checked evidence citations + offline diagrams + a self-contained site** in one DSH bundle — everything local, nothing leaves the machine.
 >
 > ```sh
-> # this repo is the maintained fork; install the plugin from it
-> REPO="<path to your dsh-ext checkout>"
+> # this repository IS the plugin package — clone it and point DSH at the checkout
+> REPO="<path to this repo checkout>"
 > CLI="<path to DSH>/runtime/cli/bin/dsh"        # e.g. "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
 >                                               # or  "C:\Users\<you>\AppData\Local\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh"
-> "$CLI" plugin --profile desktop add "$REPO/plugins/dsh-wiki"
+> "$CLI" plugin --profile desktop add "$REPO"
 > ```
 
 ## ✨ What it is
 
 A DSH plugin, maintained here as **`@dsh-ext/dsh-wiki`** — a **fork** of
 [`Acfufu/dsh-wiki`](https://github.com/Acfufu/dsh-wiki), with the reliability, pipeline and translation
-work tracked in [`specs/007-wiki-pipeline-i18n-models`](../../specs/007-wiki-pipeline-i18n-models). The
+work recorded in this repository's [`CHANGELOG.md`](CHANGELOG.md) and commit history (the development
+specs and architecture notes live in the private development tree, not here). The
 runtime id is `dsh-wiki`, which is why the package name keeps that suffix. Once installed into any
 web/desktop profile it gives you four entries:
 
@@ -67,14 +68,14 @@ The site passes a **zero-external-link machine check** (entity encoding, protoco
 
 Prereqs: a DSH Desktop / web profile (`dsh-base` + `dsh-web-app`), `python3 ≥ 3.7` (pure-stdlib builder, no third-party deps).
 
-**Route A · GUI plugin page**: sidebar "Plugins" → Add → paste this repo's plugin path (`<repo>/plugins/dsh-wiki`) → Install → Enable.
+**Route A · GUI plugin page**: sidebar "Plugins" → Add → paste this repo's checkout path (the directory containing `package.json`) → Install → Enable.
 
 **Route B · CLI**:
 
 ```sh
 CLI="<path to DSH>/runtime/cli/bin/dsh"
-REPO="<path to your dsh-ext checkout>"
-"$CLI" plugin --profile desktop add "$REPO/plugins/dsh-wiki"
+REPO="<path to this repo checkout>"
+"$CLI" plugin --profile desktop add "$REPO"
 "$CLI" plugin --profile desktop list
 ```
 
@@ -368,8 +369,8 @@ Fork-specific work lives in this repository:
   (`lib/worker-guard.js`)
 - canonical-English wikis with per-locale unit translation and structural SHA-256 verification
   (`locales/<lang>/`, `scripts/wiki_translations.py`)
-- the tracked work, decisions and open risks: [`specs/007-wiki-pipeline-i18n-models`](../../specs/007-wiki-pipeline-i18n-models)
-  and [`docs/arch-notes/`](../../docs/arch-notes)
+- the tracked work, decisions and open risks: this repository's [`CHANGELOG.md`](CHANGELOG.md) and its
+  commit history (the numbered specs and `docs/arch-notes/` stay in the private development tree)
 
 The package name here is `@dsh-ext/dsh-wiki`; `dsh-wiki` is only the runtime id. If you want the
 unmodified original, install it from the upstream repository instead.
