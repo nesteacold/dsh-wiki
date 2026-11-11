@@ -4,7 +4,7 @@
 
   <h1>dsh-wiki</h1>
 
-  <p><strong>Wiki repo cục bộ kiểu DeepWiki cho DeepSeek Harness (DSH): không upload, không mạng, bằng chứng đặt lên trước.</strong><br />
+  <p><strong>Wiki repo cục bộ kiểu DeepWiki cho DeepSeek Harness (DSH): không upload, mặc định không dùng mạng, bằng chứng đặt lên trước.</strong><br />
   Agent đọc repo ngay trên máy bạn → dựng một wiki phân trang kèm trích dẫn <code>path:line</code> (cây điều hướng + sơ đồ) → build thành một site HTML tự chứa duy nhất, do host DSH cục bộ phục vụ.</p>
 
   <p>
@@ -21,8 +21,8 @@
     <img src="docs/assets/badges/license.svg" alt="MIT License">
     <img src="docs/assets/badges/dsh.svg" alt="DSH 0.2.x compatible">
     <img src="docs/assets/badges/python.svg" alt="Python ≥3.7">
-    <img src="docs/assets/badges/tests.svg" alt="tests: 217 builder, 113 translation, 412 host, 192 module job, 64 differential, 99 worker pipeline, 64 protocol, 145 client, 114 readme parity, 302 trusted-journal/containment/guard/liveness checks">
-    <img src="docs/assets/badges/network.svg" alt="zero network">
+    <img src="docs/assets/badges/tests.svg" alt="tests: all suites pass — Python builder and translation regressions, Node host routes and trust fence, MCP adapter, job module and worker pipeline, journal/publish/containment/guard, client and update-panel React rendering, wiki freshness, README parity">
+    <img src="docs/assets/badges/network.svg" alt="network: opt-in">
   </p>
 
 </div>
@@ -36,7 +36,7 @@
 > # this repository IS the plugin package — clone it and point DSH at the checkout
 > REPO="<path to this repo checkout>"
 > CLI="<path to DSH>/runtime/cli/bin/dsh"        # e.g. "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
->                                               # or  "%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh"
+>                                               # or  "C:\Users\<you>\AppData\Local\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh"
 > "$CLI" plugin --profile desktop add "$REPO"
 > ```
 
@@ -50,7 +50,7 @@ giữ hậu tố này. Cài vào bất kỳ profile web/desktop nào là có b�
 
 | Mục | Dạng | Ghi chú |
 | --- | --- | --- |
-| **skill `dsh-wiki`** | runtime skill | Nói "generate a wiki for this repo" là giao thức theo pha tiếp quản (Phase 0 inventory → Phase 5 report): inventory → config resolution → language detection → page-tree planning → per-page writing → build + selfcheck |
+| **skill `dsh-wiki`** | runtime skill | Nói "generate a wiki for this repo" là giao thức 5 pha tiếp quản: inventory → config resolution → language detection → page-tree planning → per-page writing → build + selfcheck |
 | **lệnh `/wiki`** | slash command | `/wiki generate [path]` (chạy trong một fork subagent), `/wiki view` (in URL site cục bộ), `/wiki list` |
 | **📚 Panel Wiki ở sidebar** | global panel cột trái | Sidebar có thêm dòng 📖: bấm vào để liệt kê mọi wiki đã build, chọn một cái là đọc site ngay trong app (refresh / quay lại danh sách / mở pop-out) |
 | **📖 Nút Wiki** | slot ở header session | Mở trang index cục bộ trong một cửa sổ riêng (khi bạn không muốn rời khỏi cuộc hội thoại) |
@@ -111,6 +111,197 @@ và **các thư mục sibling** của những root đã biết cũng được qu
 là được nhận, nên wiki import qua `import-legacy` hiện lên index mà không cần config gì; `config.wikiRoots`
 thêm root bổ sung.
 
+### Agent tools — wiki như một knowledge base
+
+Plugin đăng ký **năm tool DSH native** (ở mức toàn cục, nên mọi agent trong mọi session đều thấy)
+cùng một skill thứ hai, `wiki-knowledge`, mô tả vòng lặp tra cứu. Chúng là các định nghĩa plain-object truyền
+vào `ctx.tools.register` — plugin này vẫn **không** import package `@deepseek-ai/*` nào, nên không bao giờ
+cần `defineTool`. Khi một Host không có service `tools`, plugin ghi log **một** cảnh báo và mọi bề mặt khác
+(skill, `/wiki`, route) vẫn chạy bình thường.
+
+Vì vậy `tools` **không** nằm trong danh sách `inject` cordis của plugin; nó được resolve lười bên trong
+`apply()` bằng `ctx.get("tools")`. Đo trên Host đã cài (2026-11-11): `inject` của cordis là all-or-nothing —
+`Fiber._refresh()` vô hiệu hoá cả plugin khi bất kỳ service nào được inject không có implementation, nên
+`apply()` sẽ không bao giờ chạy và skill, `/wiki` cùng các route sẽ biến mất trên một Host không có `tools`;
+cordis không có dạng `{ required, optional }`. `ctx.get(name)` chạy được mà không cần `inject` (`dsh-tool-subagent`
+của cùng profile resolve `llm` theo cách đó). Một Host thiếu cả `ctx.get` cũng suy biến y hệt: một cảnh báo,
+không throw.
+
+| Tool | Trả lời | Giới hạn cứng |
+| --- | --- | --- |
+| `wiki_search` | Page/card xếp hạng cho một truy vấn văn bản và/hoặc đường dẫn repo, kèm trích dẫn `path:line` | **20 hit** (mặc định 5) và ngân sách **24 KiB** cho cả tập kết quả |
+| `wiki_page` | Markdown của một page + danh sách file + id cha/con/anh em | **16 KiB** markdown (`truncated: true` khi bị cắt) |
+| `wiki_cards` | Card nguyên tử lọc theo `tags` (all-of), `file` hoặc `kind`; không lọc thì trả index gọn | **50 dòng** và ngân sách **24 KiB** |
+| `wiki_impact` | File đã đổi → các page/card phủ chúng, dùng đúng phép chuẩn hoá của `diff-impact` | **50 đường dẫn đầu vào** và ngân sách **24 KiB** |
+| `wiki_status` | Repo id, tiêu đề, ngôn ngữ, số page/card, `sourceCommit` so với git `HEAD`, độ cũ | một object nhỏ |
+
+**Wiki là một tấm bản đồ, không phải nguồn sự thật.** Mỗi hit mang theo các trích dẫn mà item đó vốn đã có,
+và skill bảo agent phải xác minh lại từng `path:line` được trích trong code trước khi hành động theo nó.
+
+**Ngữ nghĩa độ tươi** (cái gate mà owner yêu cầu):
+
+- `stale: false` — `sourceCommit` đã ghi bằng git `HEAD`.
+- `stale: true` — không bằng; kết quả còn mang `behind` (số commit) và `changedFiles`.
+- `stale: "unknown"` — git hoặc commit đã ghi không khả dụng. Trường hợp này **không bao giờ** bị báo là
+  `false`: không đo được thì không phải là tươi.
+- `GET /dsh-wiki/api/project?root=` phơi ra cùng các field `stale`/`behind`/`changedFiles`, được tính bởi
+  **chính** hàm mà `wiki_status` dùng, nên panel và các tool không thể bất đồng với nhau.
+
+Việc resolve repo mặc định là đóng: một `repo` tường minh chỉ được nhận khi nó đã là một root được phát hiện
+(hoặc thật sự chứa `<wikiDirName>/wiki.json`) **và** chứng minh được là canonical, không có symlink thoát ra
+ngoài. Một yêu cầu mơ hồ hoặc không biết là một lỗi có kiểu, liệt kê tên các ứng viên — không bao giờ đoán.
+Bỏ `repo` thì ưu tiên **thư mục tạo ra** session (`session.header.cwd`, bất biến — cùng sự kiện mà
+`lib/worker-guard.js:22,348` ghi lại), rồi đến wiki được phát hiện duy nhất có wiki; nhiều ứng viên thì trả
+`repo-ambiguous` chứ không đoán.
+Thông báo lỗi tới được model, nên chúng chỉ nêu `<wikiDirName>/wiki.json` **tương đối** theo wiki; một đường dẫn
+host tuyệt đối không bao giờ được nhúng vào đó.
+Nội dung wiki chỉ được đọc từ `<repo>/<wikiDirName>/wiki.json` và `generation-meta.json`, qua reader có
+containment sẵn có của plugin (không link, không hard link, file thường, ràng theo handle-identity).
+
+Giới hạn cũng áp lên *field*: id/tiêu đề/tóm tắt và danh sách tham chiếu bị cắt, và mỗi collection có một ngân
+sách byte, nên một wiki sinh ra bệnh lý không thể làm tràn một context window.
+`wiki_search` mang tính xác định — cùng input, output giống hệt từng byte, hoà thì xếp theo `(kind, id)`.
+
+**Tham số** của tool là hợp đồng của chính chúng ta, không phải của Host: `register()` kiểm `output.schema`
+nhưng không bao giờ kiểm `parameters` (bộ kiểm schema của Host cũng chấp nhận schema chỉ có annotation như JSON
+không ràng buộc). Vì vậy harness khẳng định, với mọi định nghĩa, một parameter schema gốc là object mà
+`required` (nếu có) chỉ nằm trên object — key `required` theo từng property bị từ chối.
+
+### MCP adapter — cùng wiki đó cho agent ngoài DSH (Claude Code)
+
+Session DSH nhận năm tool này một cách native. Một agent **ngoài** DSH — Claude Code, VS Code, bất kỳ MCP
+client nào — nhận cùng năm tool qua MCP từ một process nhỏ **tái dùng** `lib/wiki-tools.js`: định nghĩa, giới
+hạn và phép tính độ tươi là cùng một đoạn code, nên hai bề mặt không thể lệch nhau.
+
+**stdio là transport mặc định** — hình dạng bình thường trong terminal của người dùng: client spawn server và
+hai bên nói JSON-RPC phân tách bằng dòng mới qua stdin/stdout. Không port, không socket lắng nghe, không bề mặt
+mạng, không gì phải chọn hay giữ rảnh.
+
+```sh
+node mcp/server.mjs                                # stdio (default): JSON-RPC on stdin/stdout, no socket
+node mcp/server.mjs --transport http --port 7919   # opt-in Streamable HTTP on 127.0.0.1
+```
+
+| Flag | Ý nghĩa |
+| --- | --- |
+| `--transport stdio\|http` | Transport (mặc định `stdio`) |
+| `--port N` | Port loopback chỉ cho `--transport http` (mặc định `7919`); bị từ chối dưới 1024 và trong dải dành riêng `2190-2289` thay vì bị âm thầm dời, và bị từ chối khi đi kèm stdio mặc định thay vì bị bỏ qua |
+| `--repo PATH` | Root mặc định khi một tool call bỏ `repo` (tuyệt đối; vẫn phải qua phép chứng minh resolve thông thường) |
+| `--dsh-home DIR` | Profile home chứa `dsh-wiki/registry.json` (mặc định `$DSH_HOME` hoặc `~/.dsh`) |
+| `--wiki-dir NAME` | Thư mục wiki trong một repository (mặc định `.dsh-wiki`) |
+
+Đăng ký nó bằng installer đi kèm — nó tính đường dẫn tuyệt đối, in ra hoặc áp dụng việc đăng ký cho **Claude Code
+và Claude Desktop**, và từ chối đoán mò. Khi đó các tool xuất hiện dưới tên `mcp__dsh-wiki__wiki_search`,
+`mcp__dsh-wiki__wiki_page`, `mcp__dsh-wiki__wiki_cards`, `mcp__dsh-wiki__wiki_impact`,
+`mcp__dsh-wiki__wiki_status`:
+
+```sh
+node tools/register-mcp.mjs            # dry run: prints the exact registration, changes nothing
+node tools/register-mcp.mjs --apply    # register in Claude Code (user scope) + Claude Desktop
+node tools/register-mcp.mjs --apply --target code --scope project   # project-scoped .mcp.json
+node tools/register-mcp.mjs --uninstall --apply
+```
+
+**`--repo` là yếu tố chịu lực, đo trên máy này.** Adapter resolve một `repo` bị bỏ từ registry của DSH
+(`~/.dsh/dsh-wiki/registry.json`); registry đó chứa 8 root và **hai** trong số đó có wiki, nên một lời gọi không chỉ định trả
+`repo-ambiguous` thay vì đoán. Vì vậy installer luôn
+ghim `--repo <abs>` khi chứng minh được đúng một wiki, và thoát với exit 2 kèm danh sách ứng viên khi không thể.
+Hãy tự truyền `--repo` khi chạy từ ngoài một thư mục có wiki.
+
+Điều gì đã thực sự được xác minh ở đây, và điều gì chưa:
+
+| Bước | Bằng chứng |
+| --- | --- |
+| Claude Code chấp nhận và lưu việc đăng ký | **đã đo** — `claude mcp add -s project` ghi `.mcp.json`; `-s user` ghi `~/.claude.json` (`Added stdio MCP server dsh-wiki ... to user config`), file này giữ nguyên 62 key cấp cao và 13 project |
+| Bắt tay Claude Code ↔ server của ta, trực tiếp | **đã đo** — `claude mcp get dsh-wiki` báo `Scope: User config (available in all your projects)` và `Status: √ Connected`, còn `claude mcp list` liệt kê `dsh-wiki ... √ Connected` cạnh các server khác |
+| Gộp config Claude Desktop | **đã đo trên file thật** — `mcpServers.dsh-wiki` được chèn, `coworkUserFilesPath` và toàn bộ object `preferences` được giữ nguyên, một bản backup có timestamp được ghi bên cạnh. Claude Desktop đọc file này lúc khởi động, nên hãy **khởi động lại app** để nhận server |
+| `tools/list` / `tools/call` qua stdio | **đã đo** như một process thật — đúng argv lưu trong `.mcp.json`, stdin/stdout chuyển hướng ra file: `initialize` trả `serverInfo {name: dsh-wiki, title: Local Repo Wiki}`, `tools/list` trả đủ năm tool, một notification không sinh response, và stdout chỉ chứa byte giao thức |
+| `tools/list` / `tools/call` dưới bộ test | **đã đo** bằng `node tools/mcp-test.mjs` (110 passed, 0 skipped, 0 failed khi có quyền file đầy đủ; trong shell bị hạn chế thì các tầng CLI/stdio phụ thuộc pipe SKIP thay vì chạy) |
+
+Phạm vi quan trọng với việc phê duyệt: một entry **user-scope** được tin và kết nối ngay, còn một entry
+`.mcp.json` ở project vẫn ở trạng thái `⏸ Pending approval` cho tới khi bạn duyệt — nên một repository vừa
+clone không thể âm thầm khởi động một server.
+
+Các lệnh thô tương đương, nếu bạn thích tự gõ (thay `<path-to-checkout>` bằng đường dẫn tuyệt đối của checkout). User scope:
+
+```sh
+claude mcp add dsh-wiki -- node "<path-to-checkout>\plugins\dsh-wiki\mcp\server.mjs" --repo "<path-to-checkout>"
+```
+
+Project scope (`.mcp.json`, đường dẫn Windows được escape cho JSON; `type` là thứ Claude Code ghi). **Đừng commit
+file này:** `--repo` phải là đường dẫn tuyệt đối (`mcp/server.mjs:120` từ chối mọi thứ khác) và `command` nêu
+node của máy này, nên một `.mcp.json` đã commit là sai trên mọi máy khác và mục khi node di chuyển. User scope
+đã phủ mọi project, đó là lý do một file project thường là không cần thiết — hãy sinh nó theo từng máy bằng
+`--scope project` nếu bạn muốn, và thêm `.mcp.json` vào `.gitignore`:
+
+```json
+{ "mcpServers": { "dsh-wiki": { "type": "stdio", "command": "node", "args": ["<path-to-checkout>\\plugins\\dsh-wiki\\mcp\\server.mjs", "--repo", "<path-to-checkout>"] } } }
+```
+
+**Claude Desktop** giữ danh sách riêng tại `%APPDATA%\Claude\claude_desktop_config.json` (`~/Library/
+Application Support/Claude/claude_desktop_config.json` trên macOS); `--apply --target desktop` gộp entry vào đó
+kèm backup. Hãy khởi động lại app sau khi đăng ký.
+
+**Dự phòng / tự động hoá: Streamable HTTP.** Một số client và script chỉ nhận một URL. Hãy khởi động cùng server
+đó một cách tường minh, rồi đăng ký URL — port bạn ghi ra chính là port nó lắng nghe:
+
+```sh
+node mcp/server.mjs --transport http --port 7919
+claude mcp add --transport http dsh-wiki http://127.0.0.1:7919/mcp
+```
+
+hoặc trong `.mcp.json`:
+
+```json
+{ "mcpServers": { "dsh-wiki": { "type": "http", "url": "http://127.0.0.1:7919/mcp" } } }
+```
+
+Hãy chọn port từ 1024 trở lên (dưới đó là đặc quyền) và nằm ngoài `2190-2289` (dành riêng trên máy này — dải đó
+không bao giờ bind được). Server từ chối cả hai với exit code 2 thay vì dời đi, nên một URL đã đăng ký không thể
+âm thầm trỏ vào hư không. Endpoint là một `POST /mcp` duy nhất (cộng với kênh SSE `GET /mcp` mà client đã đo
+mở ra), và listener chỉ bind `127.0.0.1`.
+
+**Transport, như đã đo — không phải giả định.** Claude Code 2.1.286 gửi `POST /mcp` với
+`Accept: application/json, text/event-stream` và thực hiện `server/discover` → `initialize` →
+`notifications/initialized` → `GET /mcp` (SSE) → `tools/list`. Cả năm đều được implement; `tools/call` trả các
+text block đã render, và một refusal có kiểu (`ok:false`) là một kết quả bình thường với `isError:true`, không
+bao giờ là một lỗi JSON-RPC. Đo qua HTTP; đường stdio nói cùng protocol core và được bộ test chạy in-process.
+
+**Vì sao stdio là mặc định — và môi trường này không xác minh được gì.** Người dùng chạy Claude Code trong một
+terminal bình thường, nơi lệnh trên spawn server với pipe; đó là transport mà client được xây quanh, và nó không
+cần port. Một process bị DSH sandbox là ngoại lệ, không phải quy tắc: nó không spawn được child có pipe (`spawn`
+→ `EPERM`), nên một **agent bị sandbox** hoàn toàn không thể thử stdio. Tầng CLI/OS-pipe của nó vì vậy bị bỏ qua
+ở đó (một `SKIP` tường minh, không bao giờ là một pass giả) và phải được chạy một lần trong terminal bình
+thường; bản thân mặc định, hàng rào `--port` và usage text vẫn được khẳng định ngay trong sandbox thông qua
+output child lấy qua file (không qua pipe). Stdio đầu cuối với chính Claude Code **chưa** được quan sát từ môi
+trường này.
+
+**Bảo mật:** transport stdio mặc định không mở socket nào; transport HTTP tuỳ chọn chỉ bind `127.0.0.1` (không
+có option host). Mọi request HTTP phải qua bốn hàng rào: một `Host` loopback **và** một `Origin` loopback (hoặc
+không có header nào, đó là thứ CLI client gửi — trình duyệt luôn gửi cả hai, nên một trang DNS-rebinding bị từ
+chối hai lần), đường dẫn duy nhất `/mcp`, và cap body 1 MiB. `GET /mcp` mở tối đa 16 kênh SSE đồng thời (kênh
+tiếp theo là `429`, không phải thêm một file descriptor), và mọi request đều bị chặn hai lần: một `requestTimeout`
+hữu hạn cho việc nhận nó (một kết nối không bao giờ xong body sẽ bị đóng) và một deadline dispatch có chặn (30 s)
+thay vì giữ transport của nó mãi — trên stdio một lời gọi bị kẹt sẽ chặn hàng đợi tuần tự phía sau nó. Không
+giới hạn nào đóng một response SSE đang mở. Adapter chỉ đọc — nó mở `<repo>/<wikiDirName>/wiki.json` và
+`generation-meta.json` và không gì khác — không bao giờ fetch và không bao giờ ghi.
+
+Điều adapter **không** tuyên bố:
+
+- **Không có handle-identity containment.** Host đọc qua `lib/fs-contain.js` (không link ở bất kỳ cấp nào, một
+  hard link duy nhất, identity ràng theo handle). Adapter mở file đã resolve **một lần** và lấy kích thước từ
+  chính handle đó trước khi đọc (nên một lần hoán đổi giữa check và read không thể vượt cap 16 MiB), nhưng nó
+  không phát hiện được một hard link mà tên nằm trong repository còn byte nằm ở nơi khác trên cùng volume —
+  `realpath` không có đường dẫn nào để so. Khoảng hở duy nhất đó được ghi tại
+  `specs/015-wiki-mcp-adapter/plan.md`; đóng nó cần so `nlink`/inode, việc mà Host làm.
+- **Không phải một ranh giới xác thực.** Ở chế độ HTTP, bất kỳ process nào trên máy này đều với tới được port
+  loopback; các hàng rào chặn một *trang trình duyệt*, không chặn một chương trình cục bộ. Phơi ra từ xa nằm
+  ngoài phạm vi (constitution A7: TLS + credential theo thiết bị).
+
+Khi client bỏ `repo`, việc resolve theo registry của DSH (`<profile home>/dsh-wiki/registry.json`): một root tường
+minh phải tuyệt đối, canonical và hoặc đã được đăng ký hoặc thật sự chứa `<wikiDirName>/wiki.json`; nếu không thì
+dùng **đúng một** root có wiki, và nhiều root thì trả `repo-ambiguous` liệt kê basename — không bao giờ đoán.
+
 ### Generate / Update trong panel — **đang bị release gate khoá**
 
 Panel có sẵn các nút điều khiển job và một model selector, nhưng **generate chạy nền bị tắt có chủ ý** trong
@@ -162,7 +353,7 @@ còn họ 409 gồm `incremental-no-baseline`, `incremental-unavailable`, `incre
 `incremental-up-to-date`, `incremental-id-mismatch`, `incremental-unexpected-write`. Hai trong số đó tồn tại vì
 một caller đã xin incremental mà lại âm thầm nhận full rebuild là bị lừa.
 
-Ba tính chất an toàn cần nói thẳng:
+Hai tính chất an toàn cần nói thẳng:
 
 - **Staging tree được seed từ wiki đang chạy, và seed lỗi là fail cứng.** Publish thay thế cả cây đang chạy,
   nên thiếu seed sẽ làm wiki *co lại*.
@@ -195,10 +386,9 @@ worker để lại trong staging làm job fail-closed (gỡ được bằng mộ
 một thư mục *khác* có nội dung y hệt thì phép so này không phát hiện được.
 
 Giới hạn đã đo, nói ra để không ai đọc quá xa tính năng này: trên corpus thật duy nhất hiện có
-(`DXVK_Project`, `dd02d64..67a1131`) 116 file đổi ánh xạ tới **23 trong 31 page và 9 trong 25 card**, với 102
-file không ánh xạ tới page nào. Với một wiki đã trôi xa, incremental chỉ rẻ hơn full rebuild không đáng kể.
-Trong corpus đó bản thân `.dsh-wiki/` cũng được commit, nên một lần update wiki cũng hiện ra trong diff —
-repo này thì ignore nó (`.gitignore`), và đó là cách cấu hình nên dùng.
+(một workspace riêng tư, `dd02d64..67a1131`) 116 file đổi ánh xạ tới **23 trong 31 page và 9 trong 25 card**, với 102
+file không ánh xạ tới page nào. Với một wiki đã trôi xa, incremental chỉ rẻ hơn full rebuild không đáng kể, và bản thân `.dsh-wiki/` cũng
+được commit, nên một lần update wiki cũng hiện ra trong diff.
 
 Vì sao có gate: một background job sẽ chạy một session model bình thường với **không có filesystem isolation**
 ("đừng chạm vào `.dsh-wiki` đang chạy" là luật ở mức prompt, không phải sandbox), và các read route trước đây
@@ -288,6 +478,66 @@ page và `keyFiles` của từng card theo khớp đường dẫn chính xác ho
 không phủ `library/a.py`), với hậu tố `:line`/`:start-end` được chuẩn hoá bỏ đi. Nó không bao giờ build, không
 bao giờ ghi (kể cả bên trong `.dsh-wiki`), không chạm mạng, và lỗi trên đường diff thoát với exit `2`.
 
+## 🔄 Cập nhật
+
+Panel có một thẻ **Version**: phiên bản đã cài, nút **Check** (kiểm tra) và nút **Install update** (cài bản cập
+nhật). Tính năng này **tuỳ chọn bật** và mặc định tắt (`update.enabled`, xem Cấu hình): khi tắt, plugin không gửi
+bất kỳ request ra ngoài nào và thẻ chỉ báo rằng việc kiểm tra đã bị vô hiệu.
+
+**Check.** Với `update.enabled: true`, và chỉ với một bản cài qua được các yêu cầu 1-5 bên dưới, bấm **Check**
+gửi một request HTTPS tới
+`raw.githubusercontent.com/nesteacold/dsh-wiki/main/package.json` (timeout 5 s, giới hạn response 64 KiB, không
+theo redirect, không gửi credential) và đọc `version` của nó. Không có gì tự polling: panel đọc status một lần khi
+mở và thêm một lần mỗi khi bạn bấm **Check**; với `update.enabled: true`, mỗi lần đọc như vậy có thể gửi đúng
+một request đó. Cùng dữ liệu có ở `GET /dsh-wiki/api/update/status`.
+
+**Install update.** Nút chỉ hoạt động khi **mọi** yêu cầu đều thoả, được xét theo thứ tự này (cái fail đầu tiên
+thắng, và lý do của nó hiện thành chữ cạnh nút):
+
+1. `update.enabled` là `true`, và không có bản cập nhật nào khác đang chạy.
+2. Package plugin đã cài là một **thư mục thật**, không phải symlink.
+3. Nó là một git worktree **và** thư mục cài đặt chính là cấp cao nhất của worktree đó (không phải thư mục con
+   của một repository lớn hơn).
+4. `origin` là một URL `https://` tới `nesteacold/dsh-wiki` (`ssh://`, `git://`, `http://`, dạng scp và đường
+   dẫn cục bộ đều bị từ chối).
+5. Working tree sạch (`git status --porcelain` không in gì), nên công việc chưa commit không bao giờ bị chạm tới.
+6. Phiên bản đã publish là một `X.Y.Z` chặt chẽ và **mới hơn hẳn** bản đã cài — một bản publish bằng hoặc cũ hơn
+   không bao giờ được cài (không downgrade).
+
+Sau đó nó chạy `git fetch --tags --prune origin` rồi `git checkout --detach` tới tag `v<version>` (hoặc
+`<version>`) nếu có, không thì tới `origin/main`, và đọc lại `package.json` cục bộ: nó phải bằng phiên bản đã
+publish, nếu không thì revision trước đó được khôi phục và `postcondition-failed` được báo. Mọi lệnh git đều chạy
+ở chế độ cứng hoá: không credential helper, thư mục hooks trỏ vào một thư mục tạm rỗng, không đệ quy submodule,
+chỉ HTTPS, không đọc config git của user hay hệ thống, không prompt tương tác. Request là
+`POST /dsh-wiki/api/update` với body `{"confirm":"install-update"}`; thiếu đúng token đó thì update service
+không bao giờ được gọi.
+
+**Reload để hoàn tất.** Một bản cập nhật đã áp dụng **không** restart gì cả. Thẻ báo hãy reload plugin, và
+`reloadRequired` giữ `true` cho tới khi plugin được tạo lại.
+
+**Vì sao bản cài để phát triển bị từ chối.** Một bản cài là symlink — plugin được link vào profile DSH từ một
+checkout phát triển — bị từ chối với `install-is-development-link`, trước khi chạy bất kỳ lệnh git nào. Checkout
+một phiên bản đã publish vào thư mục đằng sau link sẽ ghi đè cây phát triển đó, nên ở đó cả việc kiểm tra phiên
+bản đã publish lẫn **Install update** đều không chạy; phiên bản đã publish chỉ được fetch cho các bản cài qua
+được mọi check đứng trước nó (yêu cầu 1-5).
+
+**Lý do từ chối** là một tập đóng gồm 15 mã, mỗi mã có đúng một câu cố định (không đường dẫn, output git hay văn
+bản upstream nào tới được client): `update-disabled`, `update-in-progress`, `install-not-found`,
+`install-is-development-link`, `install-not-git`, `install-not-worktree-root`, `install-origin-mismatch`,
+`install-dirty`, `latest-not-newer`, `version-invalid`, `network-unavailable`, `fetch-failed`,
+`checkout-failed`, `postcondition-failed`, `internal-error`. Tất cả là HTTP 409 trừ `internal-error` (500).
+
+**Cách làm thủ công tương đương** (điều nút làm, trong một checkout thật, sạch của plugin):
+
+```sh
+git fetch --tags --prune origin
+git checkout --detach v<version>   # or the tag <version>, or origin/main when no tag exists
+```
+
+rồi reload plugin. Khoá cấu hình: `update.enabled` (boolean, mặc định `false`; đó là khoá `update` duy nhất và
+mọi khoá khác là lỗi cấu hình). Giới hạn đã biết: đường checkout/restore cho tới nay mới được xác minh với các
+bản giả được tiêm vào, chưa với một repository thật.
+
 ## ⚔️ So với các plugin cộng đồng
 
 | | dsh-wiki | dsh-openwiki | dsh-plugin-codemap | archify |
@@ -315,6 +565,8 @@ Dòng `config` của plugin (sửa được từng dòng trong trang plugin củ
     buildTimeoutMs: 600000   # build subprocess timeout (10 min)
     selfcheckTimeoutMs: 600000
     pollMs: 500              # job supervisor poll interval
+    update:
+      enabled: false         # in-panel version check / self-update (see Updating); false = zero network
 ```
 
 Các setting chỉ dành cho job (`pythonPath`, `jobTimeoutMs`, `buildTimeoutMs`, `selfcheckTimeoutMs`, `pollMs`)
@@ -335,7 +587,7 @@ này; đường background job mặc định tắt và khi được bật cũng 
 | Hành vi | dsh-wiki |
 | --- | --- |
 | Upload nội dung repo / lịch sử Git | **không bao giờ** |
-| Request mạng (generate, sơ đồ, font, script) | **không bao giờ** (builder zero-dep, site zero-external-link) |
+| Request mạng (generate, sơ đồ, font, script) | **không bao giờ** (builder zero-dep, site zero-external-link). Ngoại lệ tuỳ chọn duy nhất là kiểm tra phiên bản/tự cập nhật (`update.enabled`, mặc định `false`; xem Cập nhật và `SECURITY.md`) |
 | Đọc nội dung object trong `.git` | **không bao giờ** (ngoại lệ duy nhất: tùy chọn `git log --oneline -15`) |
 | Vị trí artifact | chỉ trên đĩa cục bộ |
 
@@ -353,29 +605,37 @@ audit plugin thì nên đi kèm `@jieai/dsh-plugin-vet`.
 ## 🧪 Kiểm thử
 
 ```sh
+# Counts measured 2026-11-11 on Windows with full file access; each suite prints its own tally.
 python3 tests/test_build_wiki_site.py   # 217 builder regression checks (injection PoCs, SVG sanitizing, config merge, node --check on site scripts, citation resolution incl. unique-basename fallback)
 python3 tests/test_wiki_translations.py # 113 translation-policy checks (structural SHA-256 per typed unit)
-node tools/harness-test.mjs             # 412 host-half checks (skill / commands / routes / trust fence / subagent paths, plus job-gate, language API and body-read response wiring)
-node tools/jobs-harness-test.mjs        # 192 module-level job checks (drives lib/jobs.js directly, incl. starved-deadline, chunked-overflow and hostile-input regressions)
+node tools/harness-test.mjs             # host-half checks (skill / commands / routes / trust fence / subagent paths, plus job-gate, language API and body-read response wiring, plus the five agent tools). Measured 2026-11-11 with full file access: 479 PASS / 0 FAIL / 0 SKIP. Where git is unavailable the two git-dependent blocks SKIP by design (measured: 472 PASS / 0 FAIL / 2 SKIP with git removed from PATH).
+node tools/mcp-test.mjs                 # MCP adapter checks (HTTP over a real socket, in-process stdio, resolution semantics, CLI default transport + flag fences via file-captured stdio). Measured 2026-11-11 with full file access: 110 passed / 0 skipped / 0 failed; the CLI-spawned and OS-pipe tiers report SKIP where the environment denies piped child processes.
+node tools/jobs-harness-test.mjs        # 202 module-level job checks (drives lib/jobs.js directly, incl. starved-deadline, chunked-overflow and hostile-input regressions)
 node tools/frontmatter-differential-test.mjs # 64 differential checks (58 front-matter shapes: the extracted JS reader vs the real python assemble reader; 0 leaks; exits 2 rather than passing when python is absent)
 node tools/jobs-worker-test.mjs         # 99 worker-pipeline checks (prompt/guard/journal/publish-executor/translate seeding)
-node tools/worker-protocol-test.mjs     # 64 protocol checks (1 POSIX-only case skipped on Windows)
-node tools/client-smoke.mjs <react> <react-dom>  # 145 client checks (grid/detail/cards, markdown safety, zoom + focus trap, model selector, language selector, job controls)
-node tools/readme-parity-test.mjs          # 114 README parity checks (EN is the source of truth; every README.<lang>.md must match its headings, byte-identical code blocks, facts, links and length)
+node tools/worker-protocol-test.mjs     # 64 protocol checks passed (65 cases; 1 POSIX-only case skips on Windows)
+node tools/client-smoke.mjs <react> <react-dom> # 155 client checks (grid/detail/cards, markdown safety, zoom + focus trap, model selector, language selector, job controls)
 node tools/journal-test.mjs             # 75 journal validator/planner checks (incl. the exported proof vocabulary)
 node tools/journal-store-test.mjs       # 86 journal-store checks (exclusive create, flush, rename, tamper refusal)
 node tools/publish-executor-test.mjs    # 27 publish/recovery-executor checks (incl. restart restore + explicit recovery flag)
 node tools/fs-contain-test.mjs          # 27 containment checks (canonical dir, identity, guarded rename)
 node tools/worker-guard-test.mjs        # 61 worker tool-guard checks
 node tools/host-liveness-test.mjs       # 26 host-liveness checks
+node tools/readme-parity-test.mjs       # 127 README parity checks (heading skeleton, byte-identical code blocks, fact tokens, links and anchors, line ratio, no machine paths — across every README translation)
+node tools/update-test.mjs              # 145 update checks (version check + safe self-update: enabled gate, symlink/dirty-tree/origin refusals, downgrade guard, no path or upstream text in payloads, never restarts, single-flight, hardened git config)
+node tools/update-ui-test.mjs <react> <react-dom> # 72 update UI checks (the Version card in every state rendered with real React; requests only on user action; install success only reports a reload)
+node tools/wiki-freshness-test.mjs      # 39 wiki-freshness checks (changedFiles excludes the wiki dir via git pathspec, stale/behind/unknown semantics, injected fake execFile — no git, no network)
+node tools/recovery-code-projection-test.mjs # 18 recovery-code projection checks (route PLAN_CODES / releaseReason allowlists re-derived from the producers, drift in either direction fails, fail-closed fallback kept)
 ```
+
+Mỗi dòng ở trên nêu con số do chính bộ test đó in ra, theo đúng định dạng của nó: hai bộ Python in `N/M passed`; bộ `node:test` in `ℹ tests N / ℹ pass N / ℹ skipped N` (nên `worker-protocol-test.mjs` khai báo 65 ca và bỏ qua 1 ca trên Windows); các harness còn lại in một dòng `PASS` cho mỗi mục rồi kết thúc bằng `ALL PASS`. Ở đây **cố ý không có tổng số duy nhất**: một dòng `PASS` và một ca `node:test` là hai đơn vị khác nhau, cộng lại chỉ ra một con số không có ý nghĩa xác định — và mọi tổng số cố định sẽ lỗi thời ngay khi có bộ test mới. Vì vậy huy hiệu ghi `all suites pass`. Chạy lại đoạn trên để kiểm tra bất kỳ con số nào.
 
 ## ❓ Câu hỏi thường gặp
 
 **Khác gì so với DeepWiki (Cognition)?** DeepWiki là một service hosted — repo phải rời khỏi máy bạn. dsh-wiki
 dùng model ngay trong session cục bộ của bạn; không gì rời khỏi máy và artifact là một file HTML bấm đúp là mở.
 
-**Dùng với DSH bản nào?** Peer khai báo `^0.1.1-rc.1 || ^0.2.0-rc.1`; đã verify trên 0.2.2-rc.1 (pin trong engines.dsh)
+**Dùng với DSH bản nào?** Peer khai báo `^0.1.1-rc.1 || ^0.2.0-rc.1`; đã verify trên 0.2.2-rc.1 (2026-11-04
 latest). Không dùng API nào gây vỡ 0.2.2 (tools.resolve / tools.mode / Session Projection đều tránh).
 
 **Profile headless / tui?** Skill và `/wiki view|list` chạy được; `/wiki generate` cùng các route site cục bộ

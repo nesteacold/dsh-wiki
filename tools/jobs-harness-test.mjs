@@ -13,7 +13,7 @@ import { pathToFileURL } from "node:url";
 
 const here = import.meta.dirname;
 const jobsUrl = pathToFileURL(path.join(here, "..", "lib", "jobs.js")).href;
-const { createJobManager, evaluateContentGate, PUBLIC_ERROR_MESSAGES, readBoundedJson } = await import(jobsUrl);
+const { createJobManager, evaluateContentGate, PUBLIC_ERROR_MESSAGES, publicError, readBoundedJson } = await import(jobsUrl);
 const { buildWorkerPrompt, buildTranslationPrompt } = await import(pathToFileURL(path.join(here, "..", "lib", "worker-protocol.js")).href);
 // 增量上限与 commit 形状只有一份定义（叶子模块）：jobs.js 与 worker-protocol.js 各自 import 它，
 // 所以两份“不能漂移”的比对检查是空转的，已删除；改为断言“只有这一份定义”。
@@ -1037,7 +1037,8 @@ check("content gate warning: a root page with a counted directory inventory emit
   && gateInventory.warns.length === 0 && gateInventory.title === "Gate Wiki",
   JSON.stringify({ phase: gateInventory.last?.phase, published: gateInventory.last?.published, warns: gateInventory.warns, title: gateInventory.title }));
 
-// (c) 失败的闸门：自己的 failures 先报、warning 垫后，绝不遮蔽/重排，公开投影里也没有分类细节。
+// (c) 失败的闸门：自己的 failures 先报、warning 垫后，绝不遮蔽/重排。公开投影只带**有界的分类名 + 计数**
+// （publicError 的封闭枚举），detail 的阈值文本与任何路径仍然一个字节都不出去——下面的 16b 逐条钉住。
 const gateFailed = await gateRun([
   gatePage("p1", null, 1, "Repository Map", "# Repository Map\n\nshort page.\n\nSee `lib/jobs.js`.\n"),
 ]);
@@ -1049,7 +1050,8 @@ check("content gate warning: a failing gate still fails for its own failures, wi
   && gateFailed.warns[0].includes("refused") && gateFailed.warns[0].includes("[words-below-min]")
   && gateFailed.warns[1].includes("refused") && gateFailed.warns[1].includes("[page-count]")
   && gateFailed.warns[2].includes("advisory") && gateFailed.warns[2].includes("[coverage-inventory]")
-  && !JSON.stringify(gateFailed.last).includes("words-below-min"),
+  && !JSON.stringify(gateFailed.last?.error).includes("page(s) below")
+  && !JSON.stringify(gateFailed.last?.error).includes("wordsPerPage"),
   JSON.stringify({ phase: gateFailed.last?.phase, error: gateFailed.last?.error, warns: gateFailed.warns }));
 
 // (d) warning 路径与无 warning 的通过路径在 published/journal/暂存/栅栏上完全一致；失败路径仍走 aborted。
@@ -1066,6 +1068,89 @@ check("content gate warning: the advisory path changes neither published, the jo
     inventory: { published: gateInventory.last?.published, journal: gateInventory.journalPhase, staging: gateInventory.staging, busy: gateInventory.busy, blocked: gateInventory.last?.blocked },
     failed: { journal: gateFailed.journalPhase, staging: gateFailed.staging, busy: gateFailed.busy },
   }));
+
+// ---------- 16b. 内容闸门失败分类的公开投影：封闭枚举、有界、只有分类名 + 计数 ----------
+// 公开短句保持固定（它是用户唯一看到的句子），但“为什么被拒”必须能读出来：分类名 + 计数是 owner 唯一
+// 能区分“引用不足”和“缺 known-issues 页”的线索。detail 的阈值文本与任何路径一律不许离开 Host。
+// 面板拿到的就是 publicError 的结果（view() → summarize() → publicError），所以这里直接驱动它。
+{
+  const FIXED = PUBLIC_ERROR_MESSAGES["content-gate-failed"];
+  // 枚举成员原样通过，顺序 = 宿主报告的顺序。
+  const passthrough = publicError({ code: "content-gate-failed", message: "internal detail nobody may see",
+    categories: [{ category: "citations", count: 6 }, { category: "known-issues", count: 1 }] });
+  check("public error: known content-gate categories pass through with their counts, in input order",
+    JSON.stringify(passthrough) === JSON.stringify({ code: "content-gate-failed", message: FIXED,
+      categories: [{ category: "citations", count: 6 }, { category: "known-issues", count: 1 }] }),
+    JSON.stringify(passthrough));
+  check("public error: the internal message text never reaches the public projection",
+    !JSON.stringify(passthrough).includes("internal detail")
+    && passthrough.message === FIXED, JSON.stringify(passthrough));
+
+  // 枚举外的分类收敛为 "unknown"：原始 token 绝不回显。
+  const unknown = publicError({ code: "content-gate-failed", categories: [{ category: "made-up-category", count: 2 }] });
+  check("public error: a category outside the closed enum becomes the literal 'unknown'",
+    unknown.categories?.length === 1 && unknown.categories[0].category === "unknown"
+    && unknown.categories[0].count === 2 && !JSON.stringify(unknown).includes("made-up-category"),
+    JSON.stringify(unknown));
+
+  // detail 与路径：即使内部对象带着它们，公开投影里也一个字节都没有，每个条目只有两个键。
+  const leaky = publicError({ code: "content-gate-failed", message: "m", categories: [
+    { category: "words-below-min", count: 3, detail: "3 page(s) below wordsPerPage[0]=100" },
+    { category: "citations", count: 1, detail: "1 page(s) carry no a path:line citation", path: "pages/p1.md" },
+  ] });
+  const leakyJson = JSON.stringify(leaky);
+  check("public error: neither detail text nor any path appears in the public projection",
+    !leakyJson.includes("wordsPerPage") && !leakyJson.includes("pages/p1.md") && !leakyJson.includes("carry no")
+    && leaky.categories.every((entry) => Object.keys(entry).sort().join(",") === "category,count"),
+    leakyJson);
+
+  // 上界：至多 8 条，保留最先出现的那些。
+  const many = publicError({ code: "content-gate-failed",
+    categories: Array.from({ length: 12 }, (_, i) => ({ category: "citations", count: i })) });
+  check("public error: more than 8 categories are truncated to 8, keeping input order",
+    many.categories?.length === 8 && many.categories.map((entry) => entry.count).join(",") === "0,1,2,3,4,5,6,7",
+    JSON.stringify(many.categories));
+
+  // 空表示：**键整个不出现**（不用 null）；非闸门错误即使带着列表也绝不暴露。
+  const empty = publicError({ code: "content-gate-failed", message: "m" });
+  const emptyArray = publicError({ code: "content-gate-failed", categories: [] });
+  const otherCode = publicError({ code: "assemble-failed", message: "m", categories: [{ category: "citations", count: 2 }] });
+  check("public error: with no categories the key is absent (not null), for an empty list and for other codes",
+    !("categories" in empty) && !("categories" in emptyArray) && !("categories" in otherCode)
+    && JSON.stringify(otherCode) === JSON.stringify({ code: "assemble-failed", message: PUBLIC_ERROR_MESSAGES["assemble-failed"] }),
+    JSON.stringify({ empty, emptyArray, otherCode }));
+
+  // 畸形输入只收敛，绝不抛出：非数组 / 非对象条目 / 负数与浮点计数。
+  let malformed = null, threw = null;
+  try {
+    malformed = [
+      publicError({ code: "content-gate-failed", categories: "not-an-array" }),
+      publicError({ code: "content-gate-failed", categories: { category: "citations", count: 1 } }),
+      publicError({ code: "content-gate-failed",
+        categories: [null, "c", 3, [], { category: 5, count: -4 }, { category: "citations", count: 1.5 }] }),
+      publicError({ code: "content-gate-failed", categories: new Array(3) }),
+      publicError({ code: "content-gate-failed", categories: null }),
+    ];
+  } catch (error) { threw = error; }
+  check("public error: malformed category input is tolerated (never throws) and normalises to unknown / 0",
+    threw === null
+    && !("categories" in malformed[0]) && !("categories" in malformed[1])
+    && JSON.stringify(malformed[2].categories) === JSON.stringify([{ category: "unknown", count: 0 }, { category: "citations", count: 0 }])
+    && !("categories" in malformed[3]) && !("categories" in malformed[4]),
+    JSON.stringify({ threw: threw && String(threw), malformed }));
+
+  // 端到端：真 evaluateContentGate 的失败面 → job.error → view()（面板读到的形状）。
+  check("public error: the real job record exposes the gate's categories and keeps the fixed public sentence",
+    JSON.stringify(gateFailed.last?.error?.categories) === JSON.stringify([
+      { category: "words-below-min", count: 1 }, { category: "page-count", count: 1 },
+    ]) && gateFailed.last?.error?.message === FIXED && gateFailed.last?.error?.code === "content-gate-failed",
+    JSON.stringify(gateFailed.last?.error));
+  check("public error: the failed job's error stays path-free and detail-free",
+    !/[\\/]/.test(JSON.stringify(gateFailed.last?.error))
+    && !JSON.stringify(gateFailed.last?.error).includes("page(s) below"), JSON.stringify(gateFailed.last?.error));
+  check("public error: the gate's categories never enter blocked (a failed gate leaves no fence)",
+    gateFailed.last?.blocked === null, JSON.stringify(gateFailed.last?.blocked));
+}
 
 // ---------- 17. 卸载取消插件拥有的作业 ----------
 env.behavior = () => { /* 挂起 */ };

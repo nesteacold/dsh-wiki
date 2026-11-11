@@ -1208,5 +1208,99 @@ check("generate: startSession error -> fallback", ok === false);
     && !jobPosts().some((p) => p.body.action === "generate"), JSON.stringify(jobPosts()));
 }
 
+// ---- content gate: the public error carries a closed-enum category list; the panel appends a readable
+//      suffix, and the failure line is byte-identical when the list is absent. ----
+{
+  const t = (k) => mod._test.DICT.en[k] ?? k;
+  const tzh = (k) => mod._test.DICT.zh[k] ?? k;
+  const en = mod._test.DICT.en, zh = mod._test.DICT.zh;
+
+  // 两张字典表必须键集完全一致：缺一个键就会在另一种语言里露出 key 原文。
+  const enKeys = Object.keys(en).sort(), zhKeys = Object.keys(zh).sort();
+  const missingZh = enKeys.filter((k) => !Object.prototype.hasOwnProperty.call(zh, k));
+  const missingEn = zhKeys.filter((k) => !Object.prototype.hasOwnProperty.call(en, k));
+  check("dictionary: en and zh carry exactly the same keys (no half-translated entry)",
+    enKeys.length === zhKeys.length && missingZh.length === 0 && missingEn.length === 0,
+    JSON.stringify({ keyCounts: [enKeys.length, zhKeys.length], missingZh, missingEn }));
+
+  // 关闭枚举的唯一来源是 lib/jobs.js 的 PUBLIC_GATE_CATEGORIES：它是模块私有常量，必须保持私有
+  // （客户端 lib/client.js 没有构建步骤也不 import，所以它自带一份副本）。这里从 Host 源码解析出真枚举，
+  // 而不是拿另一份冒烟内置副本互相对照——后者在 Host 新增分类时两边都“通过”，面板只会把它渲染成
+  // "unknown"。期望关系：client === Host 枚举 + "unknown"（枚举外值的哨兵），两边都不许有多余项。
+  const jobsSource = readFileSync(path.join(import.meta.dirname, "..", "lib", "jobs.js"), "utf8");
+  const hostGateLiteral = /const\s+PUBLIC_GATE_CATEGORIES\s*=\s*Object\.freeze\(\s*\[([^\]]*)\]\s*\)/.exec(jobsSource);
+  const HOST_CATEGORIES = hostGateLiteral ? [...hostGateLiteral[1].matchAll(/"([^"\\]+)"/g)].map((m) => m[1]) : [];
+  const EXPECTED_CATEGORIES = [...HOST_CATEGORIES, "unknown"];
+  const clientCategories = [...mod._test.JOB_ERROR_CATEGORIES];
+  const hostSet = new Set(EXPECTED_CATEGORIES), clientSet = new Set(clientCategories);
+  const onlyClient = clientCategories.filter((c) => !hostSet.has(c));
+  const onlyHost = EXPECTED_CATEGORIES.filter((c) => !clientSet.has(c));
+  // 英文标签刻意等于枚举 token，所以英文后缀就是 (citations: 6, known-issues: 1) 这种直接可读的写法。
+  check("content gate: every closed-enum category has a label in both dictionaries, and English labels are the enum tokens",
+    HOST_CATEGORIES.length > 0
+    && EXPECTED_CATEGORIES.every((c) => en["job.cat." + c] === c && typeof zh["job.cat." + c] === "string" && zh["job.cat." + c].length > 0),
+    JSON.stringify(EXPECTED_CATEGORIES.map((c) => [c, en["job.cat." + c], zh["job.cat." + c]])));
+  check("content gate: the client's accepted category list is exactly the host's closed enum (lib/jobs.js PUBLIC_GATE_CATEGORIES) plus 'unknown'",
+    HOST_CATEGORIES.length > 0 && clientSet.size === hostSet.size && clientCategories.length === clientSet.size
+    && onlyClient.length === 0 && onlyHost.length === 0,
+    JSON.stringify({ host: HOST_CATEGORIES, client: clientCategories, onlyClient, onlyHost }));
+
+  const HOST_SENTENCE = "the candidate wiki does not meet the resolved content requirements";
+  const FIXED = en["job.failed"] + HOST_SENTENCE;
+  const ROOT = "C:\\R";
+  const catalog = { phase: "ready", def: { provider: "p", model: "m" }, failures: [],
+    models: [{ provider: "p", model: "m", label: "M", providerLabel: "p" }] };
+  const model = { provider: "p", model: "m" };
+  const failedJob = (error) => ({ id: "j5", root: ROOT, action: "generate", targetLang: "en", phase: "failed", stage: "done",
+    model: { provider: "p", model: "m" }, startedAt: "2026-01-01T00:00:00.000Z", sessionId: null, pages: null, error });
+  const controls = (job, tt) => renderToStaticMarkup(React.createElement(mod._test.JobControls,
+    { t: tt || t, root: ROOT, generated: true, catalog, model, job, busy: false,
+      gate: { known: true, disabled: false, reason: "" }, onStart() {}, onCancel() {}, onOpenSession() {}, onCopy() {} }));
+  const alertText = (html) => {
+    const m = html.match(/<div class="dw-joberr" role="alert">([\s\S]*?)<\/div>/);
+    return m ? m[1] : null;
+  };
+
+  const before = alertText(controls(failedJob({ code: "content-gate-failed", message: HOST_SENTENCE })));
+  check("content gate: without categories the failure line is exactly today's text (byte-identical, no suffix)",
+    before === FIXED, JSON.stringify(before));
+
+  const withCats = alertText(controls(failedJob({ code: "content-gate-failed", message: HOST_SENTENCE,
+    categories: [{ category: "citations", count: 6 }, { category: "known-issues", count: 1 }] })));
+  check("content gate: the panel appends a readable category/count suffix after the fixed sentence",
+    withCats === FIXED + " (citations: 6, known-issues: 1)", JSON.stringify(withCats));
+
+  const zhCats = alertText(controls(failedJob({ code: "content-gate-failed", message: HOST_SENTENCE,
+    categories: [{ category: "citations", count: 6 }, { category: "page-count", count: 2 }] }), tzh));
+  check("content gate: the Chinese panel uses its own category labels (host sentence stays verbatim)",
+    zhCats === zh["job.failed"] + HOST_SENTENCE + " (引用: 6, 页数: 2)", JSON.stringify(zhCats));
+
+  const unknownCats = alertText(controls(failedJob({ code: "content-gate-failed", message: HOST_SENTENCE,
+    categories: [{ category: "made-up", count: 3 }] })));
+  check("content gate: a category outside the closed enum renders the fixed 'unknown' label, never the raw token",
+    unknownCats === FIXED + " (unknown: 3)" && !unknownCats.includes("made-up"), JSON.stringify(unknownCats));
+
+  const junk = alertText(controls(failedJob({ code: "content-gate-failed", message: HOST_SENTENCE,
+    categories: [null, "x", [], { category: "citations", count: -2 }, { category: "config", count: 1.7 },
+      { category: "diagrams", count: "9" }] })));
+  check("content gate: malformed category entries are skipped or normalised, never rendered raw",
+    junk === FIXED + " (citations: 0, config: 1, diagrams: 0)", JSON.stringify(junk));
+
+  const leaky = alertText(controls(failedJob({ code: "content-gate-failed", message: HOST_SENTENCE,
+    categories: [{ category: "words-below-min", count: 2, detail: "2 page(s) below wordsPerPage[0]=100",
+      path: "C:\\secret\\p1.md" }] })));
+  check("content gate: detail text and paths are never rendered, even when a payload carries them",
+    leaky === FIXED + " (words-below-min: 2)" && !leaky.includes("wordsPerPage") && !leaky.includes("secret"),
+    JSON.stringify(leaky));
+
+  // 同一份 helper 也覆盖未翻译屏的失败行（两处 errText 都走它）。
+  const untranslated = renderToStaticMarkup(React.createElement(mod._test.UntranslatedPanel,
+    { t, lang: "vi", gate: { known: true, disabled: false, reason: "" }, catalogPhase: "ready", hasModel: true,
+      busy: false, onTranslate() {}, onCancel() {},
+      job: failedJob({ code: "content-gate-failed", message: HOST_SENTENCE, categories: [{ category: "citations", count: 4 }] }) }));
+  check("content gate: the failed-translate screen shows the same suffix (one helper, both surfaces)",
+    untranslated.includes(FIXED + " (citations: 4)"), untranslated.slice(0, 500));
+}
+
 console.log(FAILS.length ? `\n${FAILS.length} FAILED` : "\nALL PASS");
 process.exit(FAILS.length ? 1 : 0);

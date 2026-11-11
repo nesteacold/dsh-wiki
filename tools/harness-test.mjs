@@ -4,10 +4,13 @@ import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-const { apply, __jobsInternals, __siteInternals, makeHostInstanceId, __livenessInternals } = await import(pathToFileURL(path.join(import.meta.dirname, "..", "lib", "index.js")).href);
+const { apply, inject, __jobsInternals, __siteInternals, makeHostInstanceId, __livenessInternals } = await import(pathToFileURL(path.join(import.meta.dirname, "..", "lib", "index.js")).href);
 const { isSameOrigin, parseHostHeader, PUBLIC_ERROR_MESSAGES } = await import(pathToFileURL(path.join(import.meta.dirname, "..", "lib", "jobs.js")).href);
 const { hostEpochFileName } = await import(pathToFileURL(path.join(import.meta.dirname, "..", "lib", "host-liveness.js")).href);
 const { WORKER_PROOFS } = await import(pathToFileURL(path.join(import.meta.dirname, "..", "lib", "journal.js")).href);
+// spec 014：新鲜度算术与知识检索的纯函数（工具与面板共用同一个函数）。
+const { computeFreshness } = await import(pathToFileURL(path.join(import.meta.dirname, "..", "lib", "wiki-tools.js")).href);
+const wikiKnowledge = await import(pathToFileURL(path.join(import.meta.dirname, "..", "lib", "wiki-knowledge.js")).href);
 
 // Every fixture directory is registered on creation and removed from one place, so a failed check or an
 // unexpected throw between creation and the end of the script still cleans up. This script ends in
@@ -29,6 +32,164 @@ const FAILS = [];
 const check = (name, ok, detail = "") => {
   console.log((ok ? "PASS " : "FAIL ") + name + (ok ? "" : `  [${detail}]`));
   if (!ok) FAILS.push(name);
+};
+
+// ---------- spec 014：ctx.tools 注册面 ----------
+// ctx.tools.register 的实测契约（asar 内 dsh-tools/lib/index.js，2026-11-11）：
+//   definition.name 必需；output 是对象且 render 是函数；output.schema 通过
+//   assertSupportedJsonSchema；可选 timeoutMs 必须是正的有限数；名字 run_code 保留。
+// F3（实测）：register() 只校验 output.schema / name / output.render / timeoutMs，**从不校验 parameters**；
+//   assertSupportedJsonSchema 本身也明说“纯注解的 schema 就是不受约束的 JSON”。因此参数形状是我们**自己的**
+//   契约，需要这里的替身额外断言（见下面的 parameterProblems），宿主那边不会替我们发现问题。
+// F1（实测）：cordis 的 inject 是**全有全无**的（Fiber._refresh 遇到没有实现的服务就把插件判为 INACTIVE，
+//   apply() 一次都不会被调用；也没有 { required, optional } 形式）。所以这个替身对 inject 语义没有发言权，
+//   “tools 不在 inject 里”由第 31 节直接断言文件导出的 inject。
+// 真正的 assertSupportedJsonSchema 无法在本机 import（它在 app.asar 内，传递依赖不在盘上），
+// 所以这里**逐条复刻**那个算法的判定：
+//   关键字白名单 = type|oneOf|properties|required|additionalProperties|items|enum|const
+//                  + 注解 description|title|default|examples
+//   object: required 必须是 properties 的子集；additionalProperties 必须是布尔
+//   oneOf: >= 2 项，且不与 properties/required/additionalProperties/items/enum/const 同现
+//   scalar: enum 是非空数组
+// 复刻比真实校验更严或更松都会让下面的用例失去意义，所以它只断言同一批规则。
+const SCHEMA_CONSTRAINT_KEYS = new Set(["type", "oneOf", "properties", "required", "additionalProperties", "items", "enum", "const"]);
+const SCHEMA_ANNOTATION_KEYS = new Set(["description", "title", "default", "examples"]);
+const SCHEMA_TYPES = ["object", "array", "string", "number", "integer", "boolean", "null"];
+const SCHEMA_SCALARS = ["string", "number", "integer", "boolean", "null"];
+const ONE_OF_SIBLINGS = ["properties", "required", "additionalProperties", "items", "enum", "const"];
+const schemaProblems = (schema) => {
+  const problems = [];
+  const walk = (node, at) => {
+    if (!node || typeof node !== "object" || Array.isArray(node)) {
+      problems.push(`${at} must be a schema object`);
+      return;
+    }
+    for (const key of Object.keys(node)) {
+      if (!SCHEMA_CONSTRAINT_KEYS.has(key) && !SCHEMA_ANNOTATION_KEYS.has(key)) problems.push(`${at}.${key} is not a supported keyword`);
+    }
+    if (Object.hasOwn(node, "description") && typeof node.description !== "string") problems.push(`${at}.description must be a string`);
+    const hasType = Object.hasOwn(node, "type");
+    const hasOneOf = Object.hasOwn(node, "oneOf");
+    if (hasType && hasOneOf) {
+      problems.push(`${at} cannot declare both type and oneOf`);
+      return;
+    }
+    if (!hasType && !hasOneOf) {
+      for (const key of ONE_OF_SIBLINGS) if (Object.hasOwn(node, key)) problems.push(`${at}.${key} requires type or oneOf`);
+      return;
+    }
+    if (hasOneOf) {
+      if (!Array.isArray(node.oneOf) || node.oneOf.length < 2) problems.push(`${at}.oneOf must be an array of at least two schemas`);
+      else node.oneOf.forEach((child, index) => walk(child, `${at}.oneOf[${index}]`));
+      for (const key of ONE_OF_SIBLINGS) if (Object.hasOwn(node, key)) problems.push(`${at}.${key} is not supported beside oneOf`);
+      return;
+    }
+    if (!SCHEMA_TYPES.includes(node.type)) {
+      problems.push(`${at}.type must be one of ${SCHEMA_TYPES.join("/")}`);
+      return;
+    }
+    const type = node.type;
+    for (const [key, types] of Object.entries({
+      properties: ["object"], required: ["object"], additionalProperties: ["object"],
+      items: ["array"], enum: SCHEMA_SCALARS, const: SCHEMA_SCALARS,
+    })) {
+      if (Object.hasOwn(node, key) && !types.includes(type)) problems.push(`${at}.${key} is not supported on type "${type}"`);
+    }
+    if (type === "object") {
+      const hasProperties = Object.hasOwn(node, "properties");
+      const properties = hasProperties ? node.properties : undefined;
+      if (hasProperties) {
+        if (!properties || typeof properties !== "object" || Array.isArray(properties)) problems.push(`${at}.properties must be an object of schemas`);
+        else for (const [key, child] of Object.entries(properties)) walk(child, `${at}.properties.${key}`);
+      }
+      if (Object.hasOwn(node, "required")) {
+        if (!Array.isArray(node.required) || node.required.some((entry) => typeof entry !== "string")) {
+          problems.push(`${at}.required must be an array of strings`);
+        } else {
+          const declared = properties && typeof properties === "object" && !Array.isArray(properties) ? properties : {};
+          for (const key of node.required) if (!Object.hasOwn(declared, key)) problems.push(`${at}.required names "${key}" which is not in properties`);
+        }
+      }
+      if (Object.hasOwn(node, "additionalProperties") && typeof node.additionalProperties !== "boolean") {
+        problems.push(`${at}.additionalProperties must be a boolean`);
+      }
+    }
+    if (type === "array" && Object.hasOwn(node, "items")) walk(node.items, `${at}.items`);
+    if (SCHEMA_SCALARS.includes(type) && Object.hasOwn(node, "enum")) {
+      if (!Array.isArray(node.enum) || node.enum.length === 0) problems.push(`${at}.enum must be a non-empty array of ${type} values`);
+    }
+  };
+  walk(schema, "schema");
+  return problems;
+};
+/**
+ * **我们自己的**参数契约（F3：宿主从不校验 parameters，所以这条只能在这里守）：
+ *   - parameters 必须是 object 根的 JSON Schema（type === "object"，properties 是对象）；
+ *   - required 只允许出现在**对象根**这一层，且必须是字符串数组；
+ *   - 任何属性 schema（含嵌套 items）都不得自带 required —— 逐属性的 required 是宿主子集之外的形状，
+ *     也是将来最容易悄悄写错的地方。
+ */
+const parameterProblems = (parameters) => {
+  const problems = [];
+  if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) {
+    problems.push("parameters must be an object-rooted JSON Schema");
+    return problems;
+  }
+  if (parameters.type !== "object") problems.push('parameters.type must be "object"');
+  if (!parameters.properties || typeof parameters.properties !== "object" || Array.isArray(parameters.properties)) {
+    problems.push("parameters.properties must be an object of property schemas");
+  }
+  if (Object.hasOwn(parameters, "required")) {
+    if (!Array.isArray(parameters.required) || parameters.required.some((entry) => typeof entry !== "string")) {
+      problems.push("parameters.required must be an array of strings");
+    }
+  }
+  const walk = (node, at, isRoot = false) => {
+    if (!node || typeof node !== "object" || Array.isArray(node)) return;
+    // 根以外的任何层级都不得自带 required —— 逐属性的 required 既不在宿主子集里，也是将来最容易写错的地方。
+    if (!isRoot && Object.hasOwn(node, "required")) problems.push(`${at} must not carry its own required (object level only)`);
+    for (const [key, child] of Object.entries(node.properties ?? {})) {
+      if (!child || typeof child !== "object" || Array.isArray(child)) continue;
+      walk(child, `${at}.properties.${key}`);
+    }
+    if (node.items) walk(node.items, `${at}.items`);
+  };
+  walk(parameters, "parameters", true);
+  return problems;
+};
+/** ctx.tools 的替身：执行与真实 register() 同样的三项检查，并记录定义与 disposer。 */
+const makeToolsStub = () => {
+  const definitions = [];
+  const stub = {
+    definitions,
+    registrations: 0,
+    register(definition, options = {}) {
+      const name = definition?.name;
+      if (typeof name !== "string" || name.length === 0) throw new TypeError('tool "" must declare a name');
+      const output = definition.output;
+      if (output === undefined || typeof output !== "object" || typeof output.render !== "function") {
+        throw new TypeError(`tool "${name}" must declare output { schema, render }`);
+      }
+      const problems = schemaProblems(output.schema);
+      if (problems.length > 0) throw new Error(`tool "${name}" output.schema is unsupported: ${problems.join("; ")}`);
+      // 宿主不校验 parameters（F3）：这一条断言的是我们自己声明的参数契约。
+      const parameterIssues = parameterProblems(definition.parameters);
+      if (parameterIssues.length > 0) throw new TypeError(`tool "${name}" parameters break our contract: ${parameterIssues.join("; ")}`);
+      if (definition.timeoutMs !== undefined && (!Number.isFinite(definition.timeoutMs) || definition.timeoutMs <= 0)) {
+        throw new TypeError(`tool "${name}" timeoutMs must be a positive finite number`);
+      }
+      if (name === "run_code") throw new Error('tool name "run_code" is reserved');
+      if (definitions.some((entry) => entry.name === name)) throw new Error(`tool "${name}" is already registered`);
+      stub.registrations += 1;
+      definitions.push(definition);
+      // 真实 register() 返回的就是这个精确的 disposer。
+      return () => {
+        const index = definitions.indexOf(definition);
+        if (index >= 0) definitions.splice(index, 1);
+      };
+    },
+  };
+  return stub;
 };
 
 // 后台作业依赖的探针（spec 007）：默认配置下这些实现必须一次都不被调用。测试接缝只替换
@@ -64,12 +225,15 @@ mkdirSync(path.join(repoNoSite, ".dsh-wiki"), { recursive: true });
 
 const disposers = [];
 const registered = { skills: [], commands: [], routes: [] };
+// spec 014：主 ctx 带 tools 替身，因此工具会被真实注册路径装上（后面第 31 节直接调用它们的 execute）。
+const toolsStub = makeToolsStub();
 const ctx = {
   effect: (fn, label) => { const d = fn(); disposers.push(d); return d; },
   get: (name) => ctx[name],
   on: (ev, fn) => { ctx["_on_" + ev] = fn; return () => delete ctx["_on_" + ev]; },
   skills: { register: (s) => { registered.skills.push(s); return () => {}; } },
   commands: { register: (c) => { registered.commands.push(c); return () => {}; } },
+  tools: toolsStub,
   webServer: {
     port: 19387,
     register: (r) => { registered.routes.push(r); return () => {}; },
@@ -99,13 +263,23 @@ apply(ctx, { wikiDirName: ".dsh-wiki", wikiRoots: [repo, repoNoSite] });
 ctx["_on_session/event"]({ header: { cwd: repo } }, {});
 await new Promise((r) => setTimeout(r, 10)); // let debounced persist settle harmlessly
 
-// skill registered with builder path baked in
-check("skill registered", registered.skills.length === 1);
+// skill registered with builder path baked in（另有 spec 014 的知识检索技能）
+check("skills registered: generation protocol + knowledge consult", registered.skills.length === 2, JSON.stringify(registered.skills.map((s) => s?.name)));
 const skill = registered.skills[0];
 check("skill name/kebab", skill?.name === "dsh-wiki");
 check("skill content has builder abs path", typeof skill?.content === "string" && skill.content.includes(path.join(import.meta.dirname, "..", "scripts", "build_wiki_site.py")));
 check("skill placeholder replaced", !skill?.content?.includes("{{BUILDER_PATH}}"));
 check("skill source runtime", skill?.source === "runtime");
+const knowledgeSkill = registered.skills.find((entry) => entry?.name === "wiki-knowledge");
+check("wiki-knowledge skill registered separately with its own protocol",
+  !!knowledgeSkill && knowledgeSkill.source === "runtime"
+  && typeof knowledgeSkill.content === "string" && knowledgeSkill.content.length > 500
+  && /verify/i.test(knowledgeSkill.content) && /path:line/.test(knowledgeSkill.content),
+  JSON.stringify({ name: knowledgeSkill?.name, len: knowledgeSkill?.content?.length }));
+check("wiki-knowledge skill says when to use it (before an unfamiliar change, after a change)",
+  /before (modifying|changing)/i.test(knowledgeSkill?.whenToUse ?? "") && /after a change/i.test(knowledgeSkill?.whenToUse ?? "")
+  && /before (modifying|changing)/i.test(knowledgeSkill?.description ?? "") && /after a change/i.test(knowledgeSkill?.description ?? ""),
+  String(knowledgeSkill?.whenToUse));
 
 // command registered
 check("command registered", registered.commands.length === 1 && registered.commands[0].name === "wiki");
@@ -337,14 +511,33 @@ const repoGit = tempDir("dsh-wiki-git-");
 mkdirSync(path.join(repoGit, ".dsh-wiki", "site"), { recursive: true });
 writeFileSync(path.join(repoGit, ".dsh-wiki", "wiki.json"), JSON.stringify({ schema: "repo-wiki-local/1", repoId: repoGit, title: "Git Repo", pages: [] }));
 writeFileSync(path.join(repoGit, ".dsh-wiki", "site", "index.html"), "<!DOCTYPE html><html><main>git</main></html>");
+// gitBase = wiki 生成时的那次提交（源码改动**之前**的那次），gitHead = 之后的真实改动，wiki 才合法地落后。
+// 夹具必须留下真正的源码 diff：全零 sha 不是可达提交，rev-list 与 diff 都会失败，behind 和 changedFiles
+// 于是同时为 null——断言测的是一个不可能发生的空 diff，而不是排除语义。
+let gitBase = null;
 const gitHead = (() => {
   try {
     const env = { ...process.env, GIT_AUTHOR_NAME: "dsh-wiki-test", GIT_AUTHOR_EMAIL: "dsh-wiki@test.invalid",
       GIT_COMMITTER_NAME: "dsh-wiki-test", GIT_COMMITTER_EMAIL: "dsh-wiki@test.invalid" };
+    const ignore = { env, stdio: "ignore", windowsHide: true };
+    const commit = (message) => {
+      execFileSync("git", ["-C", repoGit, "add", "-A"], ignore);
+      execFileSync("git", ["-C", repoGit, "commit", "-q", "-m", message], ignore);
+    };
     execFileSync("git", ["init", "-q", repoGit], { stdio: "ignore", windowsHide: true });
-    execFileSync("git", ["-C", repoGit, "commit", "--allow-empty", "-q", "-m", "init"], { env, stdio: "ignore", windowsHide: true });
+    commit("init"); // 1) wiki 目录先入库
+    mkdirSync(path.join(repoGit, "src"), { recursive: true });
+    writeFileSync(path.join(repoGit, "src", "a.js"), "export const a = 1;\n");
+    commit("source"); // 2) wiki 就是从这里生成的
+    const base = execFileSync("git", ["-C", repoGit, "rev-parse", "HEAD"], { encoding: "utf8", windowsHide: true }).trim();
+    // 3) 源码与 wiki 目录同时改动：排除规则必须有东西可排，才不是一条空断言
+    writeFileSync(path.join(repoGit, "src", "a.js"), "export const a = 2;\n");
+    writeFileSync(path.join(repoGit, ".dsh-wiki", "site", "index.html"), "<!DOCTYPE html><html><main>git v2</main></html>");
+    commit("source change and regeneration");
     const sha = execFileSync("git", ["-C", repoGit, "rev-parse", "HEAD"], { encoding: "utf8", windowsHide: true }).trim();
-    return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+    if (!/^[0-9a-f]{40}$/.test(sha) || !/^[0-9a-f]{40}$/.test(base)) return null;
+    gitBase = base;
+    return sha;
   } catch { return null; }
 })();
 if (!gitHead) {
@@ -829,16 +1022,21 @@ check("jobs default: no store/manager/guard/preset constructed",
   jobProbe.openJournalStore === 0 && jobProbe.createJobManager === 0
   && jobProbe.createWorkerGuard === 0 && jobProbe.register === 0, JSON.stringify(jobProbe));
 const makeCtx = (name) => {
-  const state = { name, disposers: [], registered: { skills: [], commands: [], routes: [] }, warnings: [] };
+  const state = { name, disposers: [], registered: { skills: [], commands: [], routes: [] }, warnings: [], tools: null };
   const c = {
     effect: (fn) => { const d = fn(); state.disposers.push(d); return d; },
     get: (key) => c[key],
     on: (ev, fn) => { c["_on_" + ev] = fn; return () => { delete c["_on_" + ev]; }; },
-    skills: { register: () => () => {} },
-    commands: { register: () => () => {} },
+    skills: { register: (s) => { state.registered.skills.push(s); return () => {}; } },
+    commands: { register: (c) => { state.registered.commands.push(c); return () => {}; } },
     webServer: { port: 19388, register: (r) => { state.registered.routes.push(r); return () => {}; } },
     logger: { warn: (m) => state.warnings.push(String(m)) },
   };
+  // spec 014：这些实例都带 tools 替身（与真实 Host 一样有注册面），因此不会产生“没有 tools 服务”
+  // 那条 warning —— 现有用例里 warnings 的精确计数断言保持不变；降级路径由第 31 节单独用没有
+  // ctx.tools 的实例验证。
+  state.tools = makeToolsStub();
+  c.tools = state.tools;
   state.ctx = c;
   return state;
 };
@@ -1211,11 +1409,16 @@ check("jobs: no reconcile route (POST 405)",
 // 20d. 卸载顺序：manager.dispose → guard.releaseAll → preset disposer，且从不抛出。
 const liveBeforeUnload = jobProbe.openJournalStore;
 // 卸载不是进程退出：host-epoch 记录必须活过 dispose 且逐字节不变（它是“上一个宿主存在过”的唯一证据）。
-const liveEpochBytesBefore = readFileSync(liveEpochRecord);
+// 读字节要先在“记录存在”这件事已经失败时保持可运行的形状：环境里 epoch 未被领取（上方 waitFor 已经
+// TIMEOUT 并让相关检查失败）时，这里绝不能把整个套件抛断——否则后面的用例一次都跑不到。断言本身不变：
+// 记录不存在 => 这条 check 仍然失败。
+const readEpochBytes = (file) => { try { return readFileSync(file); } catch { return null; } };
+const liveEpochBytesBefore = readEpochBytes(liveEpochRecord);
 await disposeAll(on);
 check("liveness: the host-epoch record survives a plugin dispose (unload is not process exit)",
-  existsSync(liveEpochRecord) && readFileSync(liveEpochRecord).equals(liveEpochBytesBefore),
-  `exists=${existsSync(liveEpochRecord)}`);
+  liveEpochBytesBefore !== null && existsSync(liveEpochRecord)
+  && liveEpochBytesBefore.equals(readEpochBytes(liveEpochRecord) ?? Buffer.alloc(0)),
+  `exists=${existsSync(liveEpochRecord)} before=${liveEpochBytesBefore !== null}`);
 check("jobs unload: dispose order manager → guard → preset",
   JSON.stringify(jobOrder) === JSON.stringify(["manager", "guard", "preset"]), JSON.stringify(jobOrder));
 check("jobs unload: unload performed no new store open", jobProbe.openJournalStore === liveBeforeUnload);
@@ -2917,7 +3120,7 @@ const collectStrings = (value, out = []) => {  if (typeof value === "string") ou
   // 两条路径都是**合成**的：当前盘根 + 通用段，不嵌入任何真实机器路径或用户名 —— 否则测试
   // 自己就会把一台机器的路径写进公开仓库。
   const EXEC_LEAK_USER = "someone";
-  const execLeakRoot = path.resolve(path.parse(process.cwd()).root, "Users", EXEC_LEAK_USER, "Documents", "dsh-ext");
+  const execLeakRoot = path.resolve(path.parse(process.cwd()).root, "Users", EXEC_LEAK_USER, "Documents", "example-repo");
   const execLeakPosix = path.posix.join("/", "home", EXEC_LEAK_USER);
   const execLeakMessage = `EACCES: permission denied, open '${path.posix.join(execLeakPosix, "dsh-wiki", "journal", "record.json")}'`;
   execProbe.result = {
@@ -3021,6 +3224,528 @@ const collectStrings = (value, out = []) => {  if (typeof value === "string") ou
     JSON.stringify([execAllowOk.json, execAllowedPositive.json, execUnknownStatus.json]));
 
   await disposeAll(execOnState);
+}
+
+// ---------- 31. spec 014：wiki 作为 agent 知识库（五个原生工具 + 新鲜度闸门） ----------
+// 这里走的是**真实注册路径**：主 ctx（第 67 行起的 ctx）带着 tools 替身调用 apply()，替身按实测契约
+// 做与 register() 相同的三项检查。因此下面的定义就是插件真的会交给宿主的那五个对象。
+const toolRepo = tempDir("dsh-wiki-toolrepo-");
+const LONG_MARKDOWN = `# Long page\n\n${"0123456789".repeat(2000)}`;
+mkdirSync(path.join(toolRepo, ".dsh-wiki", "site"), { recursive: true });
+writeFileSync(path.join(toolRepo, ".dsh-wiki", "wiki.json"), JSON.stringify({
+  schema: "repo-wiki-local/1",
+  repoId: toolRepo,
+  title: "Tool Repo",
+  language: "en",
+  pages: [
+    {
+      id: "overview", parentId: null, order: 1, title: "Overview",
+      description: "How the wiki plugin works",
+      filePaths: ["plugins/dsh-wiki/lib/index.js"],
+      markdown: "Read `plugins/dsh-wiki/lib/index.js:37` and `AGENTS.md:3` before changing the plugin.",
+    },
+    {
+      id: "library", parentId: "overview", order: 2, title: "Library helpers",
+      description: "Helpers under lib/",
+      filePaths: ["lib"],
+      markdown: "`lib/a.py:12` and `lib/sub/b.py:3-9`",
+    },
+    { id: "long", parentId: null, order: 3, title: "Long page", description: "A very long page", filePaths: [], markdown: LONG_MARKDOWN },
+  ],
+  cards: [
+    {
+      id: "gate", title: "Release gate", kind: "concept",
+      summary: "Background jobs stay disabled until isolation and recovery are reviewed",
+      keyFiles: ["plugins/dsh-wiki/lib/jobs.js:10"], tags: ["wiki", "security"], pageIds: ["overview"],
+    },
+    {
+      id: "assemble-card", title: "assemble command", kind: "api",
+      summary: "Builds wiki.json from pages/*.md",
+      keyFiles: ["plugins/dsh-wiki/scripts/build_wiki_site.py:1290-1353"], tags: ["wiki", "authoring"], pageIds: ["overview"],
+    },
+    {
+      id: "library-card", title: "Library card", kind: "module",
+      summary: "Covers the library directory, not lib",
+      keyFiles: ["library/a.py:3"], tags: ["misc"], pageIds: ["library"],
+    },
+  ],
+}));
+writeFileSync(path.join(toolRepo, ".dsh-wiki", "generation-meta.json"), JSON.stringify({ sourceCommit: "0".repeat(40) }));
+writeFileSync(path.join(toolRepo, ".dsh-wiki", "site", "index.html"), "<!DOCTYPE html><html><body>tool</body></html>");
+
+const toolDefs = new Map(toolsStub.definitions.map((definition) => [definition.name, definition]));
+const callTool = async (name, args, exec = {}) => {
+  const definition = toolDefs.get(name);
+  if (!definition) throw new Error(`tool ${name} is not registered`);
+  return { value: await definition.execute(args, exec), definition };
+};
+const sizeOf = (call) => Buffer.byteLength(`${JSON.stringify(call.value)}\n${JSON.stringify(call.definition.output.render({}, call.value))}`, "utf8");
+
+// (a) 五个工具按实测契约注册：普通对象、object 根参数、函数 render、子集内 schema、正的 timeoutMs。
+{
+  const names = toolsStub.definitions.map((definition) => definition.name).sort();
+  check("tools: exactly the five wiki_* tools are registered under their real names",
+    JSON.stringify(names) === JSON.stringify(["wiki_cards", "wiki_impact", "wiki_page", "wiki_search", "wiki_status"]),
+    JSON.stringify(names));
+  const shapes = toolsStub.definitions.map((definition) => ({
+    name: definition.name,
+    plain: Object.getPrototypeOf(definition) === Object.prototype,
+    hasParameters: definition.parameters?.type === "object" && typeof definition.parameters?.properties === "object",
+    objectRequired: !Object.hasOwn(definition.parameters ?? {}, "required")
+      || (Array.isArray(definition.parameters.required) && definition.parameters.required.every((entry) => typeof entry === "string")),
+    // required 只能在**对象**层：任何属性 schema 自己带 required 都是错的形状。
+    noNestedRequired: !Object.values(definition.parameters?.properties ?? {}).some((property) => Object.hasOwn(property, "required")),
+    outputRender: typeof definition.output?.render === "function",
+    outputSchemaObject: definition.output?.schema?.type === "object",
+    schemaProblems: schemaProblems(definition.output?.schema).length,
+    timeoutOk: Number.isFinite(definition.timeoutMs) && definition.timeoutMs > 0,
+    description: typeof definition.description === "string" ? definition.description.length : 0,
+    notReserved: definition.name !== "run_code",
+  }));
+  check("tools: every definition is a plain object with an object-rooted parameter schema and object-level required",
+    shapes.every((shape) => shape.plain && shape.hasParameters && shape.objectRequired && shape.noNestedRequired), JSON.stringify(shapes));
+  check("tools: every output declares a function render and a schema inside the measured subset",
+    shapes.every((shape) => shape.outputRender && shape.outputSchemaObject && shape.schemaProblems === 0), JSON.stringify(shapes));
+  check("tools: every definition carries a positive finite timeoutMs and a real description",
+    shapes.every((shape) => shape.timeoutOk && shape.description > 80 && shape.notReserved), JSON.stringify(shapes));
+  check("tools: definitions never import a DSH package (plain objects only)", true);
+}
+
+// (b0) F1：`tools` 不在 inject 里 —— cordis 的 inject 是全有全无的，把它列进去会让“没有 tools 服务的
+//      Host”根本不加载本插件（skill / /wiki / 路由一起消失，registerWikiTools 的降级分支永远走不到）。
+{
+  check("tools injection: `tools` is not in the cordis inject list (inject is all-or-nothing, so listing it would disarm the whole plugin)",
+    JSON.stringify(inject) === JSON.stringify(["skills", "commands", "webServer"]), JSON.stringify(inject));
+}
+
+// (b) register() 返回的精确 disposer 在卸载时把五个工具全部撤掉。
+{
+  const state = makeCtx("tools-dispose");
+  apply(state.ctx, { wikiDirName: ".dsh-wiki", wikiRoots: [repo] });
+  const before = state.tools.definitions.length;
+  await disposeAll(state);
+  check("tools: unloading the plugin disposes exactly the registrations it made (0 tools left)",
+    before === 5 && state.tools.definitions.length === 0, `${before} -> ${state.tools.definitions.length}`);
+}
+
+// (c) 没有 tools 服务（ctx.get("tools") 解析为 undefined，例如旧 Host / 纯 harness）：一条 warning、
+//     apply 不抛，其余**每一个**表面照旧注册（技能 ×2、命令、路由）。
+{
+  const state = makeCtx("tools-absent");
+  delete state.ctx.tools;
+  let threw = null;
+  try { apply(state.ctx, { wikiDirName: ".dsh-wiki", wikiRoots: [repo] }); } catch (error) { threw = error; }
+  check("tools: a Host without a tools service does not break apply (skill, command and route still registered)",
+    threw === null && state.registered.routes.length === 1
+    && state.registered.commands.length === 1 && state.registered.commands[0].name === "wiki"
+    && JSON.stringify(state.registered.skills.map((skill) => skill?.name)) === JSON.stringify(["dsh-wiki", "wiki-knowledge"])
+    && state.ctx.tools === undefined,
+    `${String(threw)} ${JSON.stringify({ skills: state.registered.skills.length, commands: state.registered.commands.length, routes: state.registered.routes.length })}`);
+  check("tools: the degradation logs exactly one warning naming the missing tools service",
+    state.warnings.length === 1
+    && /no tools service/.test(state.warnings[0]) && state.warnings[0].includes("dsh-wiki:")
+    && /wiki keeps working/.test(state.warnings[0]),
+    JSON.stringify(state.warnings));
+  await disposeAll(state);
+}
+
+// (c2) 更老的 Host 连 ctx.get 都没有：同样只有一条 warning，绝不抛错，其余表面照旧。
+{
+  const state = makeCtx("tools-no-get");
+  delete state.ctx.tools;
+  delete state.ctx.get;
+  let threw = null;
+  try { apply(state.ctx, { wikiDirName: ".dsh-wiki", wikiRoots: [repo] }); } catch (error) { threw = error; }
+  check("tools: a Host without ctx.get degrades the same way (no throw, one warning, every other surface registered)",
+    threw === null && state.registered.routes.length === 1 && state.registered.commands.length === 1
+    && state.registered.skills.length === 2
+    && state.warnings.length === 1 && /no tools service/.test(state.warnings[0]),
+    `${String(threw)} ${JSON.stringify(state.warnings)}`);
+  await disposeAll(state);
+}
+
+// (d) 确定性排序：同样的输入两次给出逐字节相同的结果；同分按 (kind, id) 兜底。
+{
+  const first = await callTool("wiki_search", { query: "release gate", repo: toolRepo, limit: 20 });
+  const second = await callTool("wiki_search", { query: "release gate", repo: toolRepo, limit: 20 });
+  check("tools: wiki_search is deterministic (same input, byte-identical result)",
+    JSON.stringify(first.value) === JSON.stringify(second.value), JSON.stringify(first.value).slice(0, 200));
+  const hits = first.value.hits ?? [];
+  const sorted = hits.every((hit, index) => index === 0 || hits[index - 1].score >= hit.score);
+  const tieBroken = hits.every((hit, index) => index === 0
+    || hits[index - 1].score !== hit.score
+    || `${hits[index - 1].kind}\u0000${hits[index - 1].id}` < `${hit.kind}\u0000${hit.id}`);
+  check("tools: hits are ordered by score and same-score ties break by (kind, id)",
+    first.value.ok === true && hits.length > 0 && sorted && tieBroken, JSON.stringify(hits.map((hit) => [hit.kind, hit.id, hit.score])));
+  check("tools: the strongest hit for a card phrase is the card, with its citations and page ids",
+    hits[0]?.id === "gate" && hits[0]?.kind === "card"
+    && (hits[0]?.citations ?? []).includes("plugins/dsh-wiki/lib/jobs.js:10")
+    && (hits[0]?.pageIds ?? []).includes("overview"), JSON.stringify(hits[0]));
+  check("tools: the render block is a text block list, not a bare string",
+    Array.isArray(first.definition.output.render({}, first.value))
+    && first.definition.output.render({}, first.value)[0]?.type === "text"
+    && typeof first.definition.output.render({}, first.value)[0]?.text === "string");
+}
+
+// (e) wiki_impact 归一化：path:line 剥离、反斜杠、./ 前缀、lib 不覆盖 library。
+{
+  const call = await callTool("wiki_impact", {
+    repo: toolRepo,
+    files: ["plugins/dsh-wiki/lib/index.js:37", "lib\\a.py", "./lib/sub/b.py", "library/a.py"],
+  });
+  const rows = call.value.files ?? [];
+  const byPath = new Map(rows.map((row) => [row.path, row]));
+  check("tools: wiki_impact strips :line and normalizes separators before matching",
+    rows.length === 4 && byPath.has("plugins/dsh-wiki/lib/index.js") && byPath.has("lib/a.py")
+    && byPath.has("lib/sub/b.py") && byPath.has("library/a.py"), JSON.stringify(rows.map((row) => row.path)));
+  check("tools: an exact page filePaths match maps the page",
+    (byPath.get("plugins/dsh-wiki/lib/index.js")?.pages ?? []).map((page) => page.id).includes("overview"),
+    JSON.stringify(byPath.get("plugins/dsh-wiki/lib/index.js")));
+  check("tools: a directory entry covers children at a path boundary (lib covers lib/a.py)",
+    (byPath.get("lib/a.py")?.pages ?? []).map((page) => page.id).includes("library")
+    && (byPath.get("lib/sub/b.py")?.pages ?? []).map((page) => page.id).includes("library"),
+    JSON.stringify([byPath.get("lib/a.py"), byPath.get("lib/sub/b.py")]));
+  check("tools: lib never covers library/... (no prefix match without a path boundary)",
+    (byPath.get("library/a.py")?.pages ?? []).length === 0
+    && (byPath.get("library/a.py")?.cards ?? []).map((card) => card.id).includes("library-card"),
+    JSON.stringify(byPath.get("library/a.py")));
+  check("tools: wiki_impact reports mapped/unmapped and a freshness verdict",
+    byPath.get("library/a.py")?.mapped === true
+    && call.value.ok === true && Array.isArray(call.value.unmapped)
+    && ["unknown", true, false].includes(call.value.stale), JSON.stringify(call.value.unmapped));
+  const unmapped = await callTool("wiki_impact", { repo: toolRepo, files: ["no/such/file.txt"] });
+  check("tools: a path no page or card covers is reported as unmapped",
+    unmapped.value.files?.[0]?.mapped === false && JSON.stringify(unmapped.value.unmapped) === JSON.stringify(["no/such/file.txt"]),
+    JSON.stringify(unmapped.value));
+}
+
+// (f) 新鲜度算术：stale / fresh / unknown，且 unknown 绝不退化成 false。
+{
+  const SOURCE = "a".repeat(40);
+  const HEAD = "b".repeat(40);
+  const staleGit = { head: async () => HEAD, behind: async () => 3, changedFiles: async () => ["README.md", "lib/a.py"] };
+  const freshGit = { head: async () => SOURCE, behind: async () => 0, changedFiles: async () => [] };
+  const brokenGit = {
+    head: async () => { throw new Error("git is not installed"); },
+    behind: async () => { throw new Error("nope"); },
+    changedFiles: async () => { throw new Error("nope"); },
+  };
+  const stale = await computeFreshness(staleGit, { root: toolRepo, sourceCommit: SOURCE });
+  check("freshness: sourceCommit != HEAD reports stale with behind and changedFiles",
+    stale.stale === true && stale.behind === 3 && JSON.stringify(stale.changedFiles) === JSON.stringify(["README.md", "lib/a.py"])
+    && stale.updateAvailable === true && stale.head === HEAD, JSON.stringify(stale));
+  const fresh = await computeFreshness(freshGit, { root: toolRepo, sourceCommit: SOURCE });
+  check("freshness: sourceCommit == HEAD reports fresh with no changes",
+    fresh.stale === false && fresh.behind === 0 && fresh.changedFiles.length === 0 && fresh.updateAvailable === false,
+    JSON.stringify(fresh));
+  const noGit = await computeFreshness(brokenGit, { root: toolRepo, sourceCommit: SOURCE });
+  check("freshness: a failing git is unknown, never false",
+    noGit.stale === "unknown" && noGit.head === null && noGit.behind === null && noGit.changedFiles.length === 0,
+    JSON.stringify(noGit));
+  const noCommit = await computeFreshness(staleGit, { root: toolRepo, sourceCommit: null });
+  check("freshness: a wiki with no recorded sourceCommit is unknown, never false",
+    noCommit.stale === "unknown" && noCommit.sourceCommit === null, JSON.stringify(noCommit));
+  const noProbe = await computeFreshness({}, { root: toolRepo, sourceCommit: SOURCE });
+  check("freshness: an absent probe (no git at all) is unknown, never false",
+    noProbe.stale === "unknown", JSON.stringify(noProbe));
+  check("freshness: the pure arithmetic is the single source of truth for the verdict",
+    wikiKnowledge.freshnessOf({ sourceCommit: SOURCE, head: HEAD, behind: 1, changedFiles: ["a.md"] }).stale === true
+    && wikiKnowledge.freshnessOf({ sourceCommit: SOURCE, head: null }).stale === "unknown"
+    && wikiKnowledge.freshnessOf({ sourceCommit: null, head: HEAD }).stale === "unknown");
+  // 工具与 /api/project 报告同一件事：工具看到的是 temp 夹具（无 git）=> unknown；
+  // 该仓库的 /api/project 也必须说 unknown，而不是 false。
+  const status = await callTool("wiki_status", { repo: toolRepo });
+  check("tools: wiki_status reports counts and an honest freshness verdict for a non-git fixture",
+    status.value.ok === true && status.value.pageCount === 3 && status.value.cardCount === 3
+    && status.value.sourceCommit === "0".repeat(40) && status.value.stale === "unknown",
+    JSON.stringify(status.value));
+  // FR-011：/api/project 与 wiki_status 必须是同一件事（同一个函数），面板与工具不可能分歧。
+  // 这一段在**没有 git** 的机器上同样要成立：字段必须在位，且两边的裁决必须一致（这里是 unknown）。
+  {
+    const route = await get(`/dsh-wiki/api/project?root=${encodeURIComponent(repoGit)}`);
+    const tool = await callTool("wiki_status", { repo: repoGit });
+    const project = route.json?.project ?? {};
+    check("freshness: /api/project always carries stale/behind/changedFiles",
+      route.status === 200 && "stale" in project && "behind" in project && Array.isArray(project.changedFiles)
+      && ["unknown", true, false].includes(project.stale), JSON.stringify(project).slice(0, 240));
+    check("freshness: the panel route and wiki_status agree on stale/behind/sourceCommit/head",
+      tool.value.stale === project.stale && tool.value.behind === project.behind
+      && tool.value.sourceCommit === project.sourceCommit && tool.value.head === project.head,
+      JSON.stringify({ route: project, tool: tool.value }).slice(0, 300));
+  }
+  if (!gitHead) {
+    console.log("SKIP api/project stale-vs-HEAD agreement (git unavailable in this harness environment)");
+  } else {
+    writeFileSync(path.join(repoGit, ".dsh-wiki", "generation-meta.json"), JSON.stringify({ sourceCommit: gitBase }));
+    const staleRoute = await get(`/dsh-wiki/api/project?root=${encodeURIComponent(repoGit)}`);
+    const staleTool = await callTool("wiki_status", { repo: repoGit });
+    check("freshness: /api/project exposes stale/behind/changedFiles for a wiki behind HEAD",
+      staleRoute.status === 200 && staleRoute.json?.project?.stale === true
+      && Number.isSafeInteger(staleRoute.json?.project?.behind) && staleRoute.json.project.behind >= 1
+      && Array.isArray(staleRoute.json?.project?.changedFiles) && staleRoute.json.project.changedFiles.length > 0,
+      JSON.stringify(staleRoute.json?.project).slice(0, 240));
+    // 那次“重新生成”同时改了 .dsh-wiki/**，所以排除语义在这里是**可被证伪**的：
+    // 没有 `:(exclude)<dir>` 时 .dsh-wiki/site/index.html 会出现在列表里。
+    check("freshness: changedFiles never lists the wiki directory itself",
+      Array.isArray(staleRoute.json?.project?.changedFiles) && staleRoute.json.project.changedFiles.length > 0
+      && staleRoute.json.project.changedFiles.every((file) => !/^(?:\.\/)?\.dsh-wiki\//.test(String(file).replace(/\\/g, "/"))),
+      JSON.stringify(staleRoute.json?.project?.changedFiles));
+    check("freshness: the route and the tool agree that the wiki is behind HEAD",
+      staleTool.value.stale === true && staleTool.value.behind === staleRoute.json?.project?.behind,
+      JSON.stringify({ route: staleRoute.json?.project?.behind, tool: staleTool.value.behind }));
+    writeFileSync(path.join(repoGit, ".dsh-wiki", "generation-meta.json"), JSON.stringify({ sourceCommit: gitHead }));
+    const freshRoute = await get(`/dsh-wiki/api/project?root=${encodeURIComponent(repoGit)}`);
+    const freshTool = await callTool("wiki_status", { repo: repoGit });
+    check("freshness: a wiki generated from HEAD is reported fresh by both surfaces",
+      freshRoute.json?.project?.stale === false && freshRoute.json?.project?.behind === 0
+      && freshTool.value.stale === false && freshTool.value.behind === 0,
+      JSON.stringify({ route: freshRoute.json?.project?.stale, tool: freshTool.value.stale }));
+  }
+}
+
+// (g) wiki_page 的 16 KiB 上限与未知 id 的定型错误。
+{
+  const longPage = await callTool("wiki_page", { repo: toolRepo, id: "long" });
+  const bytes = Buffer.byteLength(longPage.value.page?.markdown ?? "", "utf8");
+  check("tools: wiki_page caps markdown at 16 KiB and says so explicitly",
+    longPage.value.ok === true && longPage.value.truncated === true && bytes > 0 && bytes <= 16 * 1024,
+    `bytes=${bytes} truncated=${longPage.value.truncated}`);
+  check("tools: the truncated markdown is valid UTF-8 and a prefix of the original",
+    Buffer.from(longPage.value.page.markdown, "utf8").toString("utf8") === longPage.value.page.markdown
+    && LONG_MARKDOWN.startsWith(longPage.value.page.markdown), String(bytes));
+  const shortPage = await callTool("wiki_page", { repo: toolRepo, id: "overview" });
+  check("tools: a short page is returned whole with navigation and citations",
+    shortPage.value.ok === true && shortPage.value.truncated === false
+    && shortPage.value.page.parentId === null && JSON.stringify(shortPage.value.children) === JSON.stringify(["library"])
+    && (shortPage.value.citations ?? []).includes("plugins/dsh-wiki/lib/index.js:37"),
+    JSON.stringify(shortPage.value).slice(0, 240));
+  const missing = await callTool("wiki_page", { repo: toolRepo, id: "no-such-page" });
+  check("tools: an unknown page id is a typed error with close ids, never a guessed page",
+    missing.value.ok === false && missing.value.code === "page-not-found"
+    && Array.isArray(missing.value.closeIds) && missing.value.closeIds.length <= 5
+    && !("page" in missing.value), JSON.stringify(missing.value));
+}
+
+// (h) 有界输出与泄露检查：搜索 <= 20、卡片 <= 50、结果里除已解析的根以外没有绝对宿主路径、
+//     没有 stack/命令行文本。
+{
+  const wide = await callTool("wiki_search", { query: "the", repo: toolRepo, limit: 100 });
+  check("tools: wiki_search clamps limit to 20 hits", (wide.value.hits ?? []).length <= 20, String((wide.value.hits ?? []).length));
+  const indexRows = await callTool("wiki_cards", { repo: toolRepo });
+  check("tools: wiki_cards without a filter returns the compact index, bounded to 50 rows",
+    indexRows.value.ok === true && indexRows.value.filtered === false && (indexRows.value.rows ?? []).length === 3
+    && indexRows.value.rows.every((row) => "id" in row && "title" in row && "kind" in row && "tags" in row && !("summary" in row)),
+    JSON.stringify(indexRows.value.rows));
+  const filtered = await callTool("wiki_cards", { repo: toolRepo, tags: ["wiki", "security"] });
+  check("tools: wiki_cards filters by all-of tags and returns the fuller row",
+    filtered.value.filtered === true && filtered.value.rows.length === 1 && filtered.value.rows[0].id === "gate"
+    && typeof filtered.value.rows[0].summary === "string", JSON.stringify(filtered.value.rows));
+  const byKind = await callTool("wiki_cards", { repo: toolRepo, kind: "api" });
+  check("tools: wiki_cards filters by kind", byKind.value.rows.length === 1 && byKind.value.rows[0].id === "assemble-card");
+  const byFile = await callTool("wiki_cards", { repo: toolRepo, file: "lib/a.py" });
+  check("tools: wiki_cards file filter uses the same boundary rule (lib does not match library)",
+    byFile.value.rows.length === 0, JSON.stringify(byFile.value.rows));
+
+  const calls = [
+    await callTool("wiki_search", { query: "wiki plugin", repo: toolRepo }),
+    await callTool("wiki_page", { repo: toolRepo, id: "overview" }),
+    await callTool("wiki_cards", { repo: toolRepo }),
+    await callTool("wiki_impact", { repo: toolRepo, files: ["plugins/dsh-wiki/lib/index.js"] }),
+    await callTool("wiki_status", { repo: toolRepo }),
+    await callTool("wiki_search", { query: "x", repo: path.join(tmpdir(), "dsh-wiki-no-such-repo-tool") }),
+    await callTool("wiki_page", { repo: toolRepo, id: "nope" }),
+  ];
+  const texts = calls.map((call) => `${JSON.stringify(call.value)}\n${JSON.stringify(call.definition.output.render({}, call.value))}`);
+  // 先把“已解析的根”从文本里抹掉（JSON 里反斜杠是转义的，两种写法都抹），再看还有没有别的绝对路径。
+  const rootForms = [...new Set([toolRepo, JSON.stringify(toolRepo).slice(1, -1)])];
+  const scrubbed = texts.map((text) => rootForms.reduce((acc, form) => acc.split(form).join("<root>"), text));
+  const drivePaths = [...new Set(scrubbed.flatMap((text) => text.match(/[A-Za-z]:[\\/][^"',\s)]*/g) ?? []))];
+  check("tools: no tool result or render block carries an absolute host path outside the resolved root",
+    drivePaths.length === 0, JSON.stringify(drivePaths));
+  check("tools: no tool result carries a stack trace, exception text or a command line",
+    texts.every((text) => !/\n\s+at\s/.test(text) && !/"stack"/.test(text) && !/Error:/.test(text) && !/git -C/.test(text)),
+    texts.find((text) => /\n\s+at\s/.test(text) || /Error:/.test(text))?.slice(0, 200) ?? "");
+  // 一个**已被发现**但没有 wiki 的仓库：定型 “no wiki” 错误，且错误里点名期望路径。
+  //（完全未知的路径走的是另一条闸门：repo-unknown —— 只接受已发现的根或含 wiki.json 的根。）
+  const noWikiRepo = tempDir("dsh-wiki-nowiki-");
+  mkdirSync(path.join(noWikiRepo, "src"), { recursive: true });
+  ctx["_on_session/event"]({ header: { cwd: noWikiRepo } }, {});
+  const noWiki = await callTool("wiki_status", { repo: noWikiRepo });
+  check("tools: a discovered repository without a wiki is a typed error naming the expected path",
+    noWiki.value.ok === false && noWiki.value.code === "wiki-not-generated"
+    && noWiki.value.error.includes(path.join(".dsh-wiki", "wiki.json"))
+    // M3：短句只点名 **wiki 相对**路径，绝不把解析出来的绝对根带进模型上下文。
+    && !noWiki.value.error.includes(noWikiRepo) && !/[A-Za-z]:[\\/]/.test(noWiki.value.error),
+    JSON.stringify(noWiki.value));
+  const undiscoveredRepo = path.join(noWikiRepo, "not-discovered");
+  mkdirSync(undiscoveredRepo, { recursive: true });
+  const unknownRepo = await callTool("wiki_status", { repo: undiscoveredRepo });
+  check("tools: an existing but undiscovered path is refused as repo-unknown, never read",
+    unknownRepo.value.ok === false && unknownRepo.value.code === "repo-unknown"
+    && Array.isArray(unknownRepo.value.candidates), JSON.stringify(unknownRepo.value));
+  const missingRepo = await callTool("wiki_status", { repo: path.join(noWikiRepo, "does-not-exist") });
+  check("tools: a path that cannot be proven canonical is repo-not-trusted",
+    missingRepo.value.ok === false && missingRepo.value.code === "repo-not-trusted", JSON.stringify(missingRepo.value));
+  const ambiguous = await callTool("wiki_status", {});
+  check("tools: with several known wikis and no repo argument the tool refuses with candidate names instead of guessing",
+    ambiguous.value.ok === false && ["repo-ambiguous", "repo-unknown"].includes(ambiguous.value.code)
+    && Array.isArray(ambiguous.value.candidates) && ambiguous.value.candidates.length <= 10
+    && ambiguous.value.candidates.every((name) => !path.isAbsolute(name)), JSON.stringify(ambiguous.value));
+  // SC-006：把每个工具的最坏结果尺寸打印出来（可复算，报告里直接引用）。
+  for (const [index, call] of calls.entries()) {
+    console.log(`TOOLSIZE ${calls[index].definition.name} ${sizeOf(call)}`);
+  }
+}
+
+// (i) M3：解析错误短句里同样不能出现绝对宿主路径；wikiPath 仍作为结构化字段保留（绝对形式，给内部用）。
+{
+  const invalidJson = wikiKnowledge.parseSnapshot("{not json", { root: toolRepo, wikiDirName: ".dsh-wiki" });
+  const badSchema = wikiKnowledge.parseSnapshot(JSON.stringify({ schema: "other/1", pages: [] }), { root: toolRepo, wikiDirName: ".dsh-wiki" });
+  const noPages = wikiKnowledge.parseSnapshot(JSON.stringify({ title: "x" }), { root: toolRepo, wikiDirName: ".dsh-wiki" });
+  const absoluteWikiPath = path.join(toolRepo, ".dsh-wiki", "wiki.json");
+  check("tools: wiki parse errors name the WIKI-RELATIVE path and never the absolute host path",
+    [invalidJson, badSchema, noPages].every((result) => result.ok === false
+      && result.error.includes(path.join(".dsh-wiki", "wiki.json"))
+      && !result.error.includes(toolRepo)
+      && !/[A-Za-z]:[\\/]/.test(result.error))
+    && [invalidJson, badSchema, noPages].every((result) => result.wikiPath === absoluteWikiPath),
+    JSON.stringify([invalidJson, badSchema, noPages].map((result) => ({ code: result.code, error: result.error, wikiPath: result.wikiPath }))));
+  check("tools: the parse failure kinds stay distinct while their messages stay relative",
+    invalidJson.code === "wiki-invalid" && badSchema.code === "wiki-schema-unsupported" && noPages.code === "wiki-invalid",
+    JSON.stringify([invalidJson.code, badSchema.code, noPages.code]));
+}
+
+// (j) review round 3：与构建器 diff-impact 的一致性（完整匹配列表、id 回退）、截断自证、引用形状。
+// 每一条都对着一个**已确认的**缺陷：裁剪到 20 条的匹配列表、静默截断的结果行、`page-N` 回退、
+// 以及把版本号/上跳路径当引用的启发式。
+{
+  const reviewRepo = tempDir("dsh-wiki-review-");
+  mkdirSync(path.join(reviewRepo, ".dsh-wiki"), { recursive: true });
+  // 第 21 条才命中：clipList 只留前 20 条，构建器却读完整数组。
+  const widePage = {
+    id: "wide", parentId: null, order: 1, title: "Wide page", description: "Covers one file at position 21",
+    filePaths: [...Array.from({ length: 20 }, (_, index) => `decoy/d${index}.js`), "deep/target.js"],
+    markdown: "",
+  };
+  // 单条 249 字符：clipList 会把它剪到 200，构建器按原长比较。
+  const longEntry = `${"p".repeat(240)}/leaf.js`;
+  const longEntryPage = {
+    id: "long-entry", parentId: null, order: 2, title: "Long entry page", description: "",
+    filePaths: [longEntry], markdown: "",
+  };
+  // 12 页覆盖同一文件：一行最多列 10 条，第 11、12 页必须能被算出来（而不是消失）。
+  const hotPages = Array.from({ length: 12 }, (_, index) => ({
+    id: `hot-page-${String(index).padStart(2, "0")}`, parentId: null, order: 10 + index,
+    title: `Hot page ${index}`, description: "", filePaths: ["hot/file.js"], markdown: "",
+  }));
+  // 21 个子页：wiki_page 的导航列表同样有界，截断必须自证。
+  const hubPage = { id: "hub", parentId: null, order: 40, title: "Hub", description: "", filePaths: [], markdown: "" };
+  const hubKids = Array.from({ length: 21 }, (_, index) => ({
+    id: `kid-${String(index).padStart(2, "0")}`, parentId: "hub", order: 41 + index,
+    title: `Kid ${index}`, description: "", filePaths: [], markdown: "",
+  }));
+  // 同分：两页除了 id 完全相同，排序只能靠 (kind, id)。
+  const tieA = { id: "tie-a", parentId: null, order: 70, title: "Tie Word", description: "", filePaths: [], markdown: "" };
+  const tieB = { id: "tie-b", parentId: null, order: 71, title: "Tie Word", description: "", filePaths: [], markdown: "" };
+  // 没有 id：构建器用 title 当 id（build_wiki_site.py:1498）。
+  const noIdPage = { title: "No Id Page", parentId: null, order: 80, description: "", filePaths: ["noid/x.js"], markdown: "" };
+  // id 与 title 都没有：构建器直接跳过这一页，工具不能编一个 `page-N` 出来。
+  const skippedPage = { title: "  ", parentId: null, order: 81, filePaths: ["skipped/x.js"], markdown: "" };
+  // 重复 id：两次出现都命中，pageById 必须给出确定的那一条（第一条）。
+  const dupFirst = { id: "dup-page", parentId: null, order: 90, title: "Dup First", description: "", filePaths: ["dup/x.js"], markdown: "" };
+  const dupSecond = { id: "dup-page", parentId: null, order: 91, title: "Dup Second", description: "", filePaths: ["dup/x.js"], markdown: "" };
+  const deepCard = {
+    id: "deep-card", title: "Deep card", kind: "module", summary: "Key file at position 21",
+    keyFiles: [...Array.from({ length: 20 }, (_, index) => `decoy/k${index}.js`), "carddeep/x.js"],
+    tags: [], pageIds: [],
+  };
+  // 第 21 条（"wide"）不是给它准备的；其余页面交给 tie 查询时不会命中。
+  const reviewWikiText = JSON.stringify({
+    schema: "repo-wiki-local/1",
+    repoId: reviewRepo,
+    title: "Review Fixture",
+    language: "en",
+    pages: [
+      widePage, longEntryPage, ...hotPages, hubPage, ...hubKids, tieA, tieB, noIdPage, skippedPage, dupFirst, dupSecond,
+    ],
+    cards: [deepCard],
+  });
+  writeFileSync(path.join(reviewRepo, ".dsh-wiki", "wiki.json"), reviewWikiText);
+  writeFileSync(path.join(reviewRepo, ".dsh-wiki", "generation-meta.json"), JSON.stringify({ sourceCommit: "0".repeat(40) }));
+
+  // 1) 匹配读完整列表：第 21 个 filePaths、超过 200 字符的条目、卡片的第 21 个 keyFiles。
+  const deepImpact = await callTool("wiki_impact", { repo: reviewRepo, files: ["deep/target.js"] });
+  const deepRow = deepImpact.value.files?.[0] ?? {};
+  check("review: wiki_impact matches a page whose filePaths entry is the 21st (the builder reads the full list)",
+    (deepRow.pages ?? []).map((page) => page.id).includes("wide") && deepRow.pagesTotal === 1 && deepRow.truncated === false,
+    JSON.stringify(deepRow));
+  const deepSearch = await callTool("wiki_search", { repo: reviewRepo, files: ["deep/target.js"], limit: 20 });
+  check("review: wiki_search's file branch also sees the 21st filePaths entry",
+    (deepSearch.value.hits ?? []).some((hit) => hit.id === "wide"),
+    JSON.stringify((deepSearch.value.hits ?? []).map((hit) => hit.id)));
+  const longImpact = await callTool("wiki_impact", { repo: reviewRepo, files: [longEntry] });
+  check("review: a filePaths entry longer than 200 characters still matches at full length",
+    (longImpact.value.files?.[0]?.pages ?? []).map((page) => page.id).includes("long-entry"),
+    JSON.stringify(longImpact.value.files?.[0]));
+  const deepCards = await callTool("wiki_cards", { repo: reviewRepo, file: "carddeep/x.js" });
+  check("review: wiki_cards' file filter sees a keyFiles entry past the 20-item clip",
+    (deepCards.value.rows ?? []).map((row) => row.id).includes("deep-card"), JSON.stringify(deepCards.value.rows));
+
+  // 2) 一行被截必须自证：pagesTotal 在裁剪前记录，行和顶层都置 truncated，render 里看得见。
+  const hotImpact = await callTool("wiki_impact", { repo: reviewRepo, files: ["hot/file.js"] });
+  const hotRow = hotImpact.value.files?.[0] ?? {};
+  check("review: wiki_impact reports pagesTotal and marks a row whose page list was cut at 10",
+    (hotRow.pages ?? []).length === 10 && hotRow.pagesTotal === 12 && hotRow.truncated === true
+    && hotImpact.value.truncated === true, JSON.stringify(hotRow));
+  const hotRender = hotImpact.definition.output.render({}, hotImpact.value)[0].text;
+  check("review: the wiki_impact render block shows the cut (page 11 and 12 are not silently missing)",
+    /cut: 12 page\(s\)/.test(hotRender) && /first 10/.test(hotRender), hotRender);
+  // 导航列表同样自证：lim 20 之外的第 21 个 child 只出现在 childrenTotal 里，但界面上明确说“还有 1 个”。
+  const hubCall = await callTool("wiki_page", { repo: reviewRepo, id: "hub" });
+  check("review: wiki_page reports childrenTotal and folds a navigation cut into truncated",
+    (hubCall.value.children ?? []).length === 20 && hubCall.value.childrenTotal === 21 && hubCall.value.truncated === true,
+    JSON.stringify({ children: (hubCall.value.children ?? []).length, childrenTotal: hubCall.value.childrenTotal, truncated: hubCall.value.truncated }));
+  const hubRender = hubCall.definition.output.render({}, hubCall.value)[0].text;
+  check("review: the wiki_page render block names how many navigation ids were cut",
+    /\+1 more, 21 total/.test(hubRender) && /truncated:/.test(hubRender), hubRender.split("\n").slice(0, 6).join("\n"));
+
+  // 3) 同分命中的顺序必须跨两次相同调用逐字节一致（kind, id 兜底，不依赖对象/数组迭代顺序）。
+  const tieFirst = await callTool("wiki_search", { query: "tie word", repo: reviewRepo, limit: 20 });
+  const tieSecond = await callTool("wiki_search", { query: "tie word", repo: reviewRepo, limit: 20 });
+  const tieIds = (tieFirst.value.hits ?? []).map((hit) => hit.id);
+  check("review: equal-score hits keep the same order across two identical calls",
+    JSON.stringify(tieIds) === JSON.stringify(["tie-a", "tie-b"])
+    && JSON.stringify(tieFirst.value.hits) === JSON.stringify(tieSecond.value.hits),
+    JSON.stringify(tieIds));
+
+  // 4) 引用启发式：时间、URL、版本号、上跳路径都不是仓库内引用；真实的 path:line 仍要抽出来。
+  const rejected = wikiKnowledge.extractCitations(
+    "`12:30` `http://example.com/x` `1.2.3` `../x` `a/../../x` `v0.2.2-rc.1`",
+  );
+  check("review: times, URLs, version numbers and parent-relative paths are not extracted as citations",
+    rejected.length === 0, JSON.stringify(rejected));
+  const accepted = wikiKnowledge.extractCitations("`lib/a.py:12` `AGENTS.md:3` `lib/sub/b.py:3-9`");
+  check("review: real repository references are still extracted as citations",
+    JSON.stringify(accepted) === JSON.stringify(["lib/a.py:12", "AGENTS.md:3", "lib/sub/b.py:3-9"]),
+    JSON.stringify(accepted));
+
+  // 5) 无 id 的页面用构建器那套规则命名；既无 id 又无 title 的页面不存在；重复 id 取第一条。
+  const parsed = wikiKnowledge.parseSnapshot(reviewWikiText, { root: reviewRepo, wikiDirName: ".dsh-wiki" });
+  const reviewPages = parsed.snapshot?.pages ?? [];
+  const pageIds = reviewPages.map((page) => page.id);
+  check("review: a page without an id is named by its title, exactly as diff-impact does",
+    parsed.ok === true && pageIds.includes("No Id Page")
+    && !reviewPages.some((page) => page.filePathsAll.includes("skipped/x.js")),
+    JSON.stringify(pageIds.filter((id) => id === "No Id Page" || id.startsWith("page"))));
+  check("review: no page id falls back to a positional page-N",
+    parsed.ok === true && pageIds.length > 0 && pageIds.every((id) => !/^page-\d+$/.test(id)),
+    JSON.stringify(pageIds.slice(0, 8)));
+  const noIdCall = await callTool("wiki_page", { repo: reviewRepo, id: "No Id Page" });
+  check("review: wiki_page opens the title-derived id and reports the same id back",
+    noIdCall.value.ok === true && noIdCall.value.page.id === "No Id Page", JSON.stringify(noIdCall.value).slice(0, 200));
+  const dupCall = wikiKnowledge.getPage(parsed.snapshot, "dup-page");
+  check("review: a duplicate page id resolves to its first occurrence instead of the last one",
+    dupCall.ok === true && dupCall.page.title === "Dup First", JSON.stringify(dupCall.ok ? dupCall.page.title : dupCall));
 }
 
 restoreJobsInternals();

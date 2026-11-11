@@ -58,14 +58,14 @@
         #
         # 2026-11-10 OWNER-AUTHORIZED RUN 2 — COMPLETED, config reverted to this commented default.
         # Owner instruction: "uỷ quyền (bật jobs.enabled, 1 job, rồi tắt)". Exactly one job ran.
-        # job 363628a3f78d4b91, DXVK_Project, model r9-fallback/ds41-cmc-ccsonnet, session
+        # job 363628a3f78d4b91, a private workspace, model r9-fallback/ds41-cmc-ccsonnet, session
         # dsh-wiki-363628a3f78d4b91, journal phase "published", 31 pages (run 1: 15).
         # Config came from <repo>/.dsh-wiki/config.json (language en, granularity hybrid,
         # pages 18-50, wordsPerPage [400,900], diagrams rich, citations strict, knownIssues true),
         # which publish preserves because it is a PROTECTED_LIVE_ENTRY.
         #
         # 2026-11-09 OWNER-AUTHORIZED CONTROLLED TRIAL — COMPLETED, config reverted to the default.
-        # One English canonical wiki was generated for DXVK_Project through the plugin (job
+        # One English canonical wiki was generated for a private workspace through the plugin (job
         # 331389551195469b, source commit dd02d64, model r9-fallback/ds41-cmc-ccsonnet):
         # 15 pages + 14 cards, 301 citations all resolving, 14 mermaid diagrams, selfcheck PASS.
         # Runtime confinement behaved as designed (a read outside the job roots was denied by the
@@ -76,7 +76,7 @@
         # (2026-11-10: that reviewer pass ran and FAILED T018 and T020 — see
         # docs/arch-notes/dsh-wiki-t018-t020-review-20261110.md. The gates remain closed.)
         # 2026-11-09 OWNER-AUTHORIZED CONTROLLED TRIAL — COMPLETED, config reverted to the default.
-        # One English canonical wiki was generated for DXVK_Project through the plugin (job
+        # One English canonical wiki was generated for a private workspace through the plugin (job
         # 331389551195469b, source commit dd02d64, model r9-fallback/ds41-cmc-ccsonnet):
         # 15 pages + 14 cards, 301 citations all resolving, 14 mermaid diagrams, selfcheck PASS.
         # Runtime confinement behaved as designed (a read outside the job roots was denied by the

@@ -11,6 +11,118 @@
   `UPSTREAM.md`），这三次的安全与健壮性修复是审计本仓库代码的前提。上游 v0.2.0、v0.2.1
   两个 tag 里没有 `CHANGELOG.md`，其条目是在 v0.2.2 时补写的。
 
+## 0.3.1 — 未发布（spec `specs/015-wiki-mcp-adapter`；同一个 wiki 也给 DSH 之外的 agent 用）
+
+spec 014 让 DSH 会话里的 agent 看到五个原生工具；本版把**同一批工具**交给 DSH 之外的 agent
+（Claude Code、VS Code、任何 MCP 客户端），传输是 MCP。
+
+- **零新依赖、零第二套实现**：`mcp/` 只做协议与传输（JSON-RPC 2.0 / MCP）。工具定义、全部上限、
+  新鲜度算术都来自 `lib/wiki-tools.js` —— `tools/list` 的 `inputSchema` 就是定义的 `parameters`，
+  `tools/call` 的 content 就是定义的 `output.render`。启动时校验定义名集合与 `WIKI_TOOL_NAMES` 一致，
+  漂移即抛错，所以两个工具面不可能给出两个答案。
+- **两种传输，默认 stdio**：`--transport stdio`（默认，换行分帧，请求串行排队以保证响应顺序）与
+  `--transport http`（显式选入，Streamable HTTP，默认端口 7919，只有 `POST /mcp` 与 `GET /mcp` 两条语义）。
+  普通终端里 Claude Code 用管道拉起服务器（`claude mcp add dsh-wiki -- node …/mcp/server.mjs`），
+  不开端口、不监听、没有网络面 —— 那才是用户实际使用的形态；只有需要 URL 的客户端/自动化才显式选
+  HTTP。`--port` 只在 http 下有意义，配 stdio 使用时直接拒绝（退出码 2），不静默忽略。
+- **实测的客户端握手**（Claude Code 2.1.286，HTTP 模式）：`server/discover` → `initialize` →
+  `notifications/initialized` → `GET /mcp`（SSE）→ `tools/list`，五步都实现。`server/discover` 是
+  兼容层：不实现它，首包就会拿到 -32601。
+- **为什么默认 stdio**：用户跑 Claude Code 的地方是普通终端，管道就是那里的正常传输；HTTP 只是回退/
+  自动化路径。DSH 沙箱是例外而不是常态：从沙箱里拉起的进程不能 spawn 带管道的子进程（`EPERM`，与
+  spec 014 spec.md:158 记录的是同一失败类），所以沙箱里的 agent 跑不了 stdio 端到端 —— 测试里这一层
+  显式 SKIP，而默认传输与参数围栏用“普通文件接住子进程输出”的 CLI 检查在沙箱内实际验证。
+- **安全**：默认 stdio 不开 socket；HTTP 模式只绑 `127.0.0.1`（没有 host 选项）；只读
+  `<repo>/<wikiDirName>/wiki.json` 与 `generation-meta.json`，不联网、不写盘；带非回环 `Origin` 的请求
+  一律 403（DNS rebinding 护栏），`Host` 头同样必须是回环名（rebinding 的请求 Host 仍是攻击者域名，
+  Origin 挡不到这一半）；无会话状态，所以 `DELETE /mcp` 是 405；请求体上限 1 MiB，非 JSON
+  `Content-Type` 是 415；`GET /mcp` 的 SSE 通道最多同时 16 条，第 17 条是 429 而不是再占一个 fd；
+  请求接收有上限（旧代码把 `requestTimeout` 设成 0，等于一个只发了半个 body 的连接可以永远占着
+  socket），单条请求另有 30 s 派发时限，超时回 -32603 —— stdio 是串行队列，一条卡死的调用不能把
+  后面所有请求一起堵住。两个上限都不影响已经打开的 SSE 响应（实测）。
+- **EOF 不丢响应**（review 修复）：stdin 的 EOF 只说明“不会再有请求”。已排队的响应必须写进流、并且
+  等到 stdout 真的收下这些字节之后才允许进程退出；旧实现在 EOF 时丢弃排队响应、并可能在写缓冲排空前
+  `process.exit`。客户端“连写几条就关 stdin”是常见收尾方式，这条路径必须有保证。
+- **入参形状与 id**（review 修复）：`arguments` 存在但不是对象 → -32602（不再悄悄当成 `{}`，否则工具会
+  带着默认参数落到另一个仓库）；`id` 只接受字符串/数字/null，其它形状回 -32600 且 `id` 为 null（不 echo
+  一个客户端发不出的形状）。
+- **受控读只开一次**（review 修复）：`stat` 之后按路径再读是 TOCTOU（中间被换成巨物/链接，容量闸失效）。
+  改为打开一次句柄，`fstat` 判普通文件与大小，再按声明大小从同一个句柄读满；文件读取期间变大也不会越过闸。
+- **与 Host 侧的差异如实记录**：进程外拿不到 Host 的句柄身份证明，读路径改用 `fs.realpath` 的包含性
+  证明（目标必须落在规范根之内、必须是普通文件、有 16 MiB 硬闸，且全部作用在同一句柄上），仓库解析沿用
+  同一套顺序与同一批定型错误码，但不是同一段代码 —— 见 `specs/015-wiki-mcp-adapter/plan.md` 的「已知差异」。
+  `repo-not-trusted` 的文案也随之更正：链接其实是**被接受**的（realpath 之后就是同一个根），旧文案
+  声称链接不受信任与行为矛盾；这条错误现在只说“这个路径在本机解析不出来”。
+- 测试：`node tools/mcp-test.mjs` —— 110 项（真实端口的 HTTP + 进程内 stdio + 解析语义 + 受控读的容量闸 +
+  有界超时 + 文件接住输出的 CLI 默认传输/参数检查，含 `--transport http` 仍能起服务并应答 initialize）。
+  在禁止 spawn 带管道子进程的环境里，CLI 端到端与 OS 管道 stdio 那一层改为显式 SKIP（从不伪造通过），
+  须在普通终端补跑。数字以该套件自己打印的 `N passed, N skipped, N failed` 为准，本节不另记总数。
+- **定型拒绝不是协议错误**：`ok:false` 走 `tools/call` 的 `isError:true`（与原生工具同义）；未知工具是
+  -32602，未知方法是 -32601，批量数组是 -32600（MCP 2025-06-18 起批量已不合法），坏 JSON 是 400 + -32700。
+
+### 面板内版本检查与安全自更新（spec `specs/016-wiki-self-update`）
+
+面板新增 **Version** 卡片：显示已安装版本（开发链接安装带 `development link` 徽标）、**Check**（检查已发布版本）
+与 **Install update**（安装更新）两个按钮。刻意**默认关闭、选入使用**。
+
+- **默认零网络**：`config.update.enabled` 默认 `false`。关闭时插件不发任何出站请求，状态路由
+  （`GET /dsh-wiki/api/update/status`）照常应答 `update-disabled`；开启后，仅对通过前置检查（真实目录、git 顶层、https origin、工作树干净）的安装，面板打开时与每次点击 Check 时各请求一次（不轮询）
+  `raw.githubusercontent.com/nesteacold/dsh-wiki/main/package.json`（5 s 超时、响应上限 64 KiB、不跟随重定向、
+  不带凭据）。`config.update` 只有 `enabled` 一个键，**多出的键是配置错误**（比 `config.jobs` 更严）：
+  仓库、分支、超时、字节上限都固定、不可配置。
+- **只对满足全部条件的安装动手**（`lib/update.js` 的 preflight，首个失败即拒绝）：安装路径是**真实目录**（不是
+  符号链接）、是 git worktree 且安装目录就是该 worktree 的顶层、`origin` 是指向 `nesteacold/dsh-wiki` 的
+  **`https://`** 地址、工作树干净、已发布版本为严格 `X.Y.Z` 且**严格新于**已安装版本（降级守卫）。随后
+  `git fetch --tags --prune origin` → `git checkout --detach <目标>`（优先 `v<版本>` / `<版本>` 标签，没有则
+  `origin/main`），再重读本地 `package.json` 必须等于已发布版本，否则尝试回到原修订并报 `postcondition-failed`。
+- **确认令牌**：`POST /dsh-wiki/api/update` 的请求体必须恰为 `{"confirm":"install-update"}`，同时沿用同源、
+  `application/json`、4 KiB 请求体上限与回环 Host 围栏；缺少或写错令牌时服务一次都不会被调用。
+- **git 在隔离配置下运行**（每次调用）：`credential.helper=` 与 `credential.interactive=never`、`core.hooksPath`
+  指向一个空的临时目录（仓库里的 `post-checkout` 等钩子不会执行）、`core.fsmonitor=false`、
+  `submodule.recurse=false`、`protocol.allow=never` + `protocol.https.allow=always`；环境只放行白名单变量，
+  并设 `GIT_CONFIG_NOSYSTEM=1`、空的 `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`、`GIT_TERMINAL_PROMPT=0`；
+  参数以数组传入、不经 shell；无法创建临时沙箱则不运行任何 git。
+- **封闭的 15 个原因码**（`REASON_CODES`）：`update-disabled`、`update-in-progress`、`install-not-found`、
+  `install-is-development-link`、`install-not-git`、`install-not-worktree-root`、`install-origin-mismatch`、
+  `install-dirty`、`latest-not-newer`、`version-invalid`、`network-unavailable`、`fetch-failed`、
+  `checkout-failed`、`postcondition-failed`、`internal-error`。每个码只对应一句固定文案；响应里**没有**
+  文件路径、git stderr 或上游错误文本，只有 `internal-error` 是 5xx，其余拒绝为 409。
+- **开发链接安装按设计被拒绝**：本机的 profile 条目是指向开发树的符号链接，面板据此报
+  `install-is-development-link`，Install update 不可用，也不会获取已发布版本。拒绝发生在任何 git 调用之前。
+- **更新之后需要手动重载**：成功只回答 `reloadRequired: true`，插件**不会**自行重载或重启，由用户决定何时
+  重启插件；重载之前该提示在状态路由里持续存在。
+- **并发**：同一实例同一时刻只允许一个更新（第二个得到 `update-in-progress`）。
+- **验证范围如实记录**：`node tools/update-test.mjs` 与 `node tools/update-ui-test.mjs` 通过注入的假 git 与假
+  fetch 验证守卫；**写路径（fetch/checkout/回滚）从未对真实仓库执行过**，规格 §8.4 记录了待做的演练。
+
+## 0.3.0 — 未发布（spec `specs/014-wiki-agent-tools`；wiki 作为 agent 的知识库）
+
+wiki 从“人能看的站点”变成“agent 能查的知识库”：五个原生 DSH 工具 + 第二个技能 + 新鲜度闸门。
+`wiki.json` schema 仍是 `repo-wiki-local/1`，构建器**未改动**（无子命令变更、无输出变更）。
+
+- **五个工具**（`ctx.tools.register` 的普通对象定义，全局注册，每个会话的每个 agent 都看得到）：
+  `wiki_search`（打分检索页面/卡片，默认 5 条、上限 20 条，每条带 `path:line` 引用）、
+  `wiki_page`（单页 markdown，硬上限 16 KiB 并置 `truncated`）、
+  `wiki_cards`（按 tags 全含 / file / kind 过滤；无过滤返回紧凑索引，最多 50 行）、
+  `wiki_impact`（改动文件 → 受影响的页面/卡片，与构建器 `diff-impact` 的归一/边界语义一致，最多 50 个路径）、
+  `wiki_status`（repo id/标题/语言/页数/卡片数/`sourceCommit`/`HEAD`/`behind`/`stale`）。
+  不新增任何依赖，也不 import `@deepseek-ai/*`（宿主服务仍全部经 `ctx` 按名解析，所以用的是对象定义而不是
+  `defineTool`）；Host 没有 `tools` 服务时只记一条 warning，技能/命令/路由照旧。
+- **新鲜度闸门（owner 要求）**：`sourceCommit != HEAD` 即 stale，并从 git 读 `behind` 与 `changedFiles`。
+  git 不可用、或 wiki 没有记录 `sourceCommit`，一律 `stale: "unknown"` —— **绝不**假设为 `false`。
+  `GET /dsh-wiki/api/project` 增加同名的 `stale`/`behind`/`changedFiles` 字段，与 `wiki_status` 调用
+  **同一个函数**，面板与工具不可能给出两个答案。
+- **有界输出（契约级）**：除“20 条命中 / 16 KiB 页面 / 50 行卡片 / 50 个 impact 路径”外，字段与引用列表
+  也各自有上限，且每个集合还有字节预算（24 KiB），超限按确定顺序截断并置 `truncated`。
+  实测最坏尺寸见 README。
+- **仓库解析**：显式 `repo` 只接受“已发现根”或真正含 `<wikiDirName>/wiki.json` 的根，且必须通过既有的
+  规范路径/无链接证明；歧义或未知返回定型错误 + 候选**名字**（不回显别的绝对路径），绝不猜。
+  读取仅限 `<repo>/<wikiDirName>/wiki.json` 与 `generation-meta.json`，走既有受控读（无链接、单链接普通
+  文件、句柄身份绑定）。
+- **第二个技能 `wiki-knowledge`**：说明“先检索 → 再读页 → 最后回代码核对引用”的循环，以及何时使用
+  （改不熟悉的模块之前、改动之后查影响）。“**wiki 是地图不是真相**”写在技能、工具描述与 README 里。
+- 测试：宿主 harness 412 → 444 项（新增注册形状/disposer/降级/确定性排序/归一化/新鲜度/上限与泄露检查）。
+
 ## 0.2.1 — 未发布（spec `specs/007-wiki-pipeline-i18n-models` 第一切片；后台作业被发布闸门关闭）
 
 面板内后台 Generate / Update 与模型选择器已实现，但 **2026-11-09 评审后整段关闭**，直到写路径具备真正的文件系统隔离、恢复（recovery）可信为止。当前对外契约：
@@ -42,7 +154,7 @@
 
 ## 0.2.0 — 未发布
 
-知识卡片与生成体验（spec `specs/004-wiki-knowledge-cards`，dsh-ext）。`wiki.json` schema 仍为 `repo-wiki-local/1`；无卡片的 wiki 构建输出与 0.1.x 逐字节一致（时间戳除外）。
+知识卡片与生成体验（spec `specs/004-wiki-knowledge-cards`）。`wiki.json` schema 仍为 `repo-wiki-local/1`；无卡片的 wiki 构建输出与 0.1.x 逐字节一致（时间戳除外）。
 
 - 知识卡片：`wiki.json` 可选 `cards` 数组（`id/title/kind/summary/keyFiles/related/tags/pageIds`），构建器清洗与告警，>200 张告警；站点新增卡片网格（按类型/标签筛选）、单卡视图（关键文件、相关卡片、引用页面）、卡片进入全文搜索。
 - 页面链接 `[文本](#card-<id>)` 渲染为站内锚点；目标缺失降级为纯文本并告警。

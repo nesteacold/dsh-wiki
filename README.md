@@ -4,7 +4,7 @@
 
   <h1>dsh-wiki</h1>
 
-  <p><strong>DeepWiki-style local repo wiki for DeepSeek Harness (DSH): zero upload, zero network, evidence first.</strong><br />
+  <p><strong>DeepWiki-style local repo wiki for DeepSeek Harness (DSH): zero upload, zero network by default, evidence first.</strong><br />
   The agent reads your repository locally → produces a paged wiki with <code>path:line</code> citations (nav tree + diagrams) → builds a single self-contained HTML site served by your local DSH host.</p>
 
   <p>
@@ -20,8 +20,8 @@
     <img src="docs/assets/badges/license.svg" alt="MIT License">
     <img src="docs/assets/badges/dsh.svg" alt="DSH 0.2.x compatible">
     <img src="docs/assets/badges/python.svg" alt="Python ≥3.7">
-    <img src="docs/assets/badges/tests.svg" alt="tests: 217 builder, 113 translation, 412 host, 192 module job, 64 differential, 99 worker pipeline, 64 protocol, 145 client, 114 readme parity, 302 trusted-journal/containment/guard/liveness checks">
-    <img src="docs/assets/badges/network.svg" alt="zero network">
+    <img src="docs/assets/badges/tests.svg" alt="tests: all suites pass — Python builder and translation regressions, Node host routes and trust fence, MCP adapter, job module and worker pipeline, journal/publish/containment/guard, client and update-panel React rendering, wiki freshness, README parity">
+    <img src="docs/assets/badges/network.svg" alt="network: opt-in">
   </p>
 
 </div>
@@ -35,7 +35,7 @@
 > # this repository IS the plugin package — clone it and point DSH at the checkout
 > REPO="<path to this repo checkout>"
 > CLI="<path to DSH>/runtime/cli/bin/dsh"        # e.g. "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
->                                               # or  "%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh"
+>                                               # or  "C:\Users\<you>\AppData\Local\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh"
 > "$CLI" plugin --profile desktop add "$REPO"
 > ```
 
@@ -50,7 +50,7 @@ web/desktop profile it gives you four entries:
 
 | Entry | Shape | Notes |
 | --- | --- | --- |
-| **`dsh-wiki` skill** | runtime skill | Say "generate a wiki for this repo" and the phased protocol takes over (Phase 0 inventory → Phase 5 report): inventory → config resolution → language detection → page-tree planning → per-page writing → build + selfcheck |
+| **`dsh-wiki` skill** | runtime skill | Say "generate a wiki for this repo" and the 5-phase protocol takes over: inventory → config resolution → language detection → page-tree planning → per-page writing → build + selfcheck |
 | **`/wiki` command** | slash command | `/wiki generate [path]` (runs in a fork subagent), `/wiki view` (prints the local site URL), `/wiki list` |
 | **📚 Sidebar Wiki panel** | left sidebar global panel | A new 📖 row in the sidebar: click to list every built wiki, pick one and the site is read right inside the app (refresh / back to list / pop-out) |
 | **📖 Wiki button** | session-header slot | Opens the local index page in a standalone window (when you don't want to leave the conversation) |
@@ -97,6 +97,205 @@ Local routes (loopback on the desktop host):
 - `/dsh-wiki/api/status` — JSON status
 
 **Discovery**: session workspaces are remembered automatically (persisted to `<profile home>/dsh-wiki/registry.json`), and **sibling directories** of known roots are scanned too — any dir containing `<wikiDirName>/site/index.html` is picked up, so wikis imported via `import-legacy` show up in the index with zero config; `config.wikiRoots` adds extra roots.
+
+### Agent tools — the wiki as a knowledge base
+
+The plugin registers **five native DSH tools** (globally, so every agent in every session sees them)
+plus a second skill, `wiki-knowledge`, that documents the consult loop. They are plain-object
+definitions passed to `ctx.tools.register` — this plugin still imports **no** `@deepseek-ai/*` package,
+so it never needs `defineTool`. When a Host exposes no `tools` service, the plugin logs **one** warning
+and every other surface (skill, `/wiki`, routes) keeps working.
+
+`tools` is therefore **not** in the plugin's cordis `inject` list; it is resolved lazily inside `apply()`
+with `ctx.get("tools")`. Measured against the installed Host (2026-11-11): cordis `inject` is
+all-or-nothing — `Fiber._refresh()` deactivates the whole plugin when any injected service has no
+implementation, so `apply()` would never run and the skill, `/wiki` and the routes would all disappear
+on a Host without `tools`; cordis has no `{ required, optional }` form. `ctx.get(name)` works without
+`inject` (the same profile's `dsh-tool-subagent` resolves `llm` that way). A Host that also lacks
+`ctx.get` degrades identically: one warning, no throw.
+
+| Tool | Answers | Hard bound |
+| --- | --- | --- |
+| `wiki_search` | Ranked pages/cards for a text query and/or repository paths, with `path:line` citations | **20 hits** (default 5) and a **24 KiB** collection budget |
+| `wiki_page` | One page's markdown + its file list + parent/children/sibling ids | **16 KiB** markdown (`truncated: true` when cut) |
+| `wiki_cards` | Atomic cards filtered by `tags` (all-of), `file`, or `kind`; no filter returns the compact index | **50 rows** and a **24 KiB** budget |
+| `wiki_impact` | Changed files → the pages/cards that cover them, using `diff-impact`'s exact normalization | **50 input paths** and a **24 KiB** budget |
+| `wiki_status` | Repo id, title, language, page/card counts, `sourceCommit` vs git `HEAD`, staleness | one small object |
+
+**The wiki is a map, not the source of truth.** Every hit carries the citations the item already
+makes, and the skill tells an agent to re-verify each cited `path:line` in code before acting on it.
+
+**Freshness semantics** (the gate the owner asked for):
+
+- `stale: false` — the recorded `sourceCommit` equals git `HEAD`.
+- `stale: true` — it does not; the result also carries `behind` (commit count) and `changedFiles`.
+- `stale: "unknown"` — git or the recorded commit is unavailable. This is **never** reported as
+  `false`: unmeasurable is not fresh.
+- `GET /dsh-wiki/api/project?root=` exposes the same `stale`/`behind`/`changedFiles` fields, computed by
+  the **same** function as `wiki_status`, so the panel and the tools cannot disagree.
+
+Repository resolution is closed by default: an explicit `repo` is accepted only when it is already a
+discovered root (or really contains `<wikiDirName>/wiki.json`) **and** proves canonical with no symlink
+escape. An ambiguous or unknown request is a typed error listing candidate names — never a guess.
+Omitting `repo` prefers the session's **creation directory** (`session.header.cwd`, immutable — the
+same fact `lib/worker-guard.js:22,348` records), then the single discovered wiki that has one; several
+candidates produce `repo-ambiguous` rather than a guess.
+Error messages reach the model, so they name only the wiki-**relative** `<wikiDirName>/wiki.json`; an
+absolute host path is never embedded in one.
+Wiki content is read only from `<repo>/<wikiDirName>/wiki.json` and `generation-meta.json`, through the
+plugin's existing contained reader (no link, no hard link, regular file, handle-identity bound).
+
+Bounds also apply to *fields*: ids/titles/summaries and reference lists are clipped, and each
+collection has a byte budget, so a pathological generated wiki cannot flood a context window.
+`wiki_search` is deterministic — same input, byte-identical output, ties broken by `(kind, id)`.
+
+Tool **parameters** are our own contract, not the Host's: `register()` validates `output.schema` but
+never `parameters` (the Host's schema check also accepts annotation-only schemas as unconstrained JSON).
+The harness therefore asserts, for every definition, an object-rooted parameter schema whose `required`
+(when present) sits on the object only — a per-property `required` key is rejected.
+
+### MCP adapter — the same wiki for agents outside DSH (Claude Code)
+
+DSH sessions get the five tools natively. An agent **outside** DSH — Claude Code, VS Code, any MCP
+client — gets the same five tools over MCP from one small process that **reuses** `lib/wiki-tools.js`:
+the definitions, the bounds and the freshness arithmetic are the same code, so the two surfaces cannot
+drift apart.
+
+**stdio is the default transport** — the normal shape in a user terminal: the client spawns the server
+and both sides speak newline-delimited JSON-RPC over stdin/stdout. No port, no listening socket, no
+network surface, nothing to choose or keep free.
+
+```sh
+node mcp/server.mjs                                # stdio (default): JSON-RPC on stdin/stdout, no socket
+node mcp/server.mjs --transport http --port 7919   # opt-in Streamable HTTP on 127.0.0.1
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--transport stdio\|http` | Transport (default `stdio`) |
+| `--port N` | Loopback port for `--transport http` only (default `7919`); refused below 1024 and in the reserved `2190-2289` instead of being silently moved, and refused with the stdio default instead of being ignored |
+| `--repo PATH` | Default root when a tool call omits `repo` (absolute; still passes the normal resolution proof) |
+| `--dsh-home DIR` | Profile home holding `dsh-wiki/registry.json` (default `$DSH_HOME` or `~/.dsh`) |
+| `--wiki-dir NAME` | Wiki directory inside a repository (default `.dsh-wiki`) |
+
+Register it with the bundled installer — it computes the absolute paths, emits or applies the
+registration for **Claude Code and Claude Desktop**, and refuses to guess. The tools then appear as
+`mcp__dsh-wiki__wiki_search`, `mcp__dsh-wiki__wiki_page`, `mcp__dsh-wiki__wiki_cards`,
+`mcp__dsh-wiki__wiki_impact`, `mcp__dsh-wiki__wiki_status`:
+
+```sh
+node tools/register-mcp.mjs            # dry run: prints the exact registration, changes nothing
+node tools/register-mcp.mjs --apply    # register in Claude Code (user scope) + Claude Desktop
+node tools/register-mcp.mjs --apply --target code --scope project   # project-scoped .mcp.json
+node tools/register-mcp.mjs --uninstall --apply
+```
+
+**`--repo` is load-bearing, measured on this machine.** The adapter resolves an omitted `repo` from
+the DSH registry (`~/.dsh/dsh-wiki/registry.json`); that registry held 8 roots and **two** of them
+carried a wiki, so an unqualified call answers `repo-ambiguous` rather than guessing. The installer
+therefore always pins `--repo <abs>` when it can prove exactly one wiki, and exits 2 with the
+candidate list when it cannot. Pass `--repo` yourself when running from outside a wiki-bearing
+directory.
+
+What was actually verified here, and what was not:
+
+| Step | Evidence |
+| --- | --- |
+| Claude Code accepts and stores the registration | **measured** — `claude mcp add -s project` wrote `.mcp.json`; `-s user` wrote `~/.claude.json` (`Added stdio MCP server dsh-wiki ... to user config`), which keeps 62 top-level keys and 13 projects intact |
+| Claude Code ↔ our server handshake, live | **measured** — `claude mcp get dsh-wiki` reports `Scope: User config (available in all your projects)` and `Status: √ Connected`, and `claude mcp list` lists `dsh-wiki ... √ Connected` next to the other servers |
+| Claude Desktop config merge | **measured on the real file** — `mcpServers.dsh-wiki` inserted, `coworkUserFilesPath` and the whole `preferences` object preserved, timestamped backup written beside it. Claude Desktop reads this file at launch, so **restart the app** to pick the server up |
+| `tools/list` / `tools/call` over stdio | **measured** as a real process — the exact argv stored in `.mcp.json`, stdin/stdout redirected to files: `initialize` returns `serverInfo {name: dsh-wiki, title: Local Repo Wiki}`, `tools/list` returns all five tools, a notification produces no response, and stdout carries protocol bytes only |
+| `tools/list` / `tools/call` under the test suite | **measured** by `node tools/mcp-test.mjs` (110 passed, 0 skipped, 0 failed with full file access; in a restricted shell the pipe-dependent CLI/stdio tiers SKIP instead) |
+
+Scope matters for approval: a **user-scope** entry is trusted and connects immediately, while a
+project `.mcp.json` entry stays `⏸ Pending approval` until you approve it — so a cloned repository
+cannot silently start a server.
+
+The raw equivalents, if you prefer typing them (replace `<path-to-checkout>` with the absolute path of your checkout). User scope:
+
+```sh
+claude mcp add dsh-wiki -- node "<path-to-checkout>\plugins\dsh-wiki\mcp\server.mjs" --repo "<path-to-checkout>"
+```
+
+Project scope (`.mcp.json`, Windows path escaped for JSON; `type` is what Claude Code writes). **Do not
+commit this file:** `--repo` must be an absolute path (`mcp/server.mjs:120` rejects anything else) and
+`command` names this machine's node, so a committed `.mcp.json` is wrong on every other machine and rots
+when node moves. User scope already covers every project, which is why a project file is normally
+unnecessary — generate it per machine with `--scope project` if you want it, and add `.mcp.json` to
+`.gitignore`:
+
+```json
+{ "mcpServers": { "dsh-wiki": { "type": "stdio", "command": "node", "args": ["<path-to-checkout>\\plugins\\dsh-wiki\\mcp\\server.mjs", "--repo", "<path-to-checkout>"] } } }
+```
+
+**Claude Desktop** keeps its own list at `%APPDATA%\Claude\claude_desktop_config.json` (`~/Library/
+Application Support/Claude/claude_desktop_config.json` on macOS); `--apply --target desktop` merges
+the entry there with a backup. Restart the app after registering.
+
+**Fallback / automation: Streamable HTTP.** Some clients and scripts only accept a URL. Start the same
+server explicitly, then register the URL — the port you write down is the port it listens on:
+
+```sh
+node mcp/server.mjs --transport http --port 7919
+claude mcp add --transport http dsh-wiki http://127.0.0.1:7919/mcp
+```
+
+or in `.mcp.json`:
+
+```json
+{ "mcpServers": { "dsh-wiki": { "type": "http", "url": "http://127.0.0.1:7919/mcp" } } }
+```
+
+Pick a port at or above 1024 (below that is privileged) and outside `2190-2289` (reserved on this
+machine — that range can never bind). The server refuses both with exit code 2 instead of moving, so a
+registered URL cannot silently point at nothing. The endpoint is a single `POST /mcp` (plus the
+`GET /mcp` SSE channel the measured client opens), and the listener binds `127.0.0.1` only.
+
+**Transport, as measured — not assumed.** Claude Code 2.1.286 sends `POST /mcp` with
+`Accept: application/json, text/event-stream` and performs `server/discover` → `initialize` →
+`notifications/initialized` → `GET /mcp` (SSE) → `tools/list`. All five are implemented; `tools/call`
+returns the rendered text blocks, and a typed refusal (`ok:false`) is a normal result with
+`isError:true`, never a JSON-RPC error. Measured over HTTP; the stdio path speaks the same protocol
+core and is exercised in-process by the test suite.
+
+**Why stdio is the default — and what this environment could not verify.** The user runs Claude Code
+in a normal terminal, where the command above spawns the server with pipes; that is the transport the
+client is built around, and it needs no port. A DSH-sandboxed process is the exception, not the rule:
+it cannot spawn piped children (`spawn` → `EPERM`), so a **sandboxed agent** cannot exercise stdio at
+all. Its CLI/OS-pipe tier is therefore skipped there (an explicit `SKIP`, never a fake pass) and must
+be run once in a normal terminal; the default itself, the `--port` fence and the usage text are still
+asserted inside the sandbox through file-captured (non-pipe) child output. End-to-end stdio against
+Claude Code itself was **not** observed from this environment.
+
+**Security:** the default stdio transport opens no socket; the opt-in HTTP transport binds `127.0.0.1`
+only (no host option). Every HTTP request must pass four fences: a loopback `Host` **and** a loopback
+`Origin` (or neither header, which is what a CLI client sends — a browser always sends both, so a
+DNS-rebinding page is refused twice over), the single path `/mcp`, and a 1 MiB body cap. `GET /mcp`
+opens at most 16 concurrent SSE channels (the next one is `429`, not another file descriptor), and every
+request is bounded twice: a finite `requestTimeout` for receiving it (a connection that never finishes its
+body is closed) and a bounded dispatch deadline (30 s) instead of holding its transport forever — on stdio
+a wedged call would otherwise block the serialized queue behind it. Neither bound closes an open SSE
+response. The adapter is read-only — it opens `<repo>/<wikiDirName>/wiki.json` and
+`generation-meta.json` and nothing else — never fetches and never writes.
+
+What the adapter **does not** claim:
+
+- **No handle-identity containment.** The Host reads through `lib/fs-contain.js` (no link at any level,
+  single hard link, identity bound to the handle). The adapter opens the resolved file **once** and takes
+  its size from that same handle before reading it (so a swap between check and read cannot bypass the
+  16 MiB cap), but it cannot detect a hard link whose name is inside the repository while its bytes live
+  elsewhere on the same volume — `realpath` has no path to compare. That one gap is recorded in
+  `specs/015-wiki-mcp-adapter/plan.md`; closing it needs `nlink`/inode comparison, which the Host does.
+- **Not an authentication boundary.** In HTTP mode any process on this machine can reach the loopback
+  port; the fences stop a *browser page*, not a local program. Remote exposure is out of scope
+  (constitution A7: TLS + per-device credentials).
+
+When the client omits `repo`, resolution follows the DSH registry
+(`<profile home>/dsh-wiki/registry.json`): an explicit root must be absolute, canonical and either
+already registered or really contain `<wikiDirName>/wiki.json`; otherwise **exactly one** wiki-bearing
+root is used, and several produce `repo-ambiguous` listing basenames — never a guess.
+
+
 
 ### In-panel Generate / Update — **disabled by the release gate**
 
@@ -151,7 +350,7 @@ with the wrong action is 400 `incremental-not-for-generate` / `incremental-not-f
 `incremental-up-to-date`, `incremental-id-mismatch`, `incremental-unexpected-write`. Two of these exist
 because a caller who asked for incremental and silently received a full rebuild has been lied to.
 
-Three safety properties are worth stating plainly:
+Two safety properties are worth stating plainly:
 
 - **The staging tree is seeded from the live wiki, and a failed seed is a hard failure.** Publication
   replaces the live tree, so a missing seed would make the wiki *shrink*.
@@ -187,10 +386,9 @@ update), and a directory replaced by a *different* directory with identical cont
 comparison.
 
 Measured limit, stated so nobody over-reads the feature: on the only real corpus available
-(`DXVK_Project`, `dd02d64..67a1131`) 116 changed files mapped to **23 of 31 pages and 9 of 25 cards**,
+(a private workspace, `dd02d64..67a1131`) 116 changed files mapped to **23 of 31 pages and 9 of 25 cards**,
 with 102 files mapped to no page at all. For a wiki that has drifted far, incremental is barely cheaper
-than a full rebuild. In that corpus `.dsh-wiki/` is itself committed, so a wiki update also shows up in
-the diff — this repository ignores it instead (`.gitignore`), which is the recommended setting.
+than a full rebuild, and `.dsh-wiki/` is itself committed, so a wiki update also shows up in the diff.
 
 Why the gate: a background job would run an ordinary model session with **no filesystem isolation**
 ("do not touch the live `.dsh-wiki`" is a prompt-level rule, not a sandbox), and the former read routes
@@ -240,6 +438,11 @@ proof); Windows durability is still `"file-flushed"`, not dir-synced; and this r
 exercised end to end over HTTP at any revision. **Treat post-restart recovery as unreviewed until an
 independent verdict is written down.**
 
+
+
+
+
+
 The implementation is still in the tree (`lib/jobs.js`): staging publication, canonical-`en` language
 gate, protected host-owned `config.json`/`locales/`, single-flight fence, cancel/quarantine, bounded
 timeouts, backup recovery, plus the write fences (same-origin, JSON content type, 32 KB cap, project
@@ -273,6 +476,61 @@ python3 scripts/build_wiki_site.py diff-impact --wiki <repo>/.dsh-wiki [--repo <
 
 `--from` defaults to the recorded `sourceCommit` (`generation-meta.json`, else `wiki.json`), `--to` to `HEAD`; `--repo` defaults to `wiki.json` `repoId`. The JSON report on stdout has `from`, `to`, `changedFiles`, `affectedPages`, `affectedCards` and `unmappedFiles`: changed files are matched against each page's `filePaths` and each card's `keyFiles` by exact path or directory prefix (`lib` covers `lib/a.py`, not `library/a.py`), with `:line`/`:start-end` suffixes normalized away. It never builds, never writes (not even inside `.dsh-wiki`), never touches the network, and failures on the diff path exit `2`.
 
+## 🔄 Updating
+
+The panel has a **Version** card: the installed version, a **Check** button and an **Install update**
+button. It is **opt-in** and off by default (`update.enabled`, see Configuration): with it off the plugin makes
+no outbound request at all and the card only says that checks are disabled.
+
+**Check.** With `update.enabled: true`, and only for an install that passes requirements 1-5 below, pressing **Check** makes one HTTPS request to
+`raw.githubusercontent.com/nesteacold/dsh-wiki/main/package.json` (5 s timeout, 64 KiB response cap, redirects
+not followed, no credentials sent) and reads its `version`. Nothing polls: the panel reads the status once when it opens and again each time you press **Check**; with `update.enabled: true` each such read can make that one request. The same data is on `GET /dsh-wiki/api/update/status`.
+
+**Install update.** The button works only when **every** requirement holds, evaluated in this order (the first
+failure wins, and its reason is shown as text next to the button):
+
+1. `update.enabled` is `true`, and no other update is running.
+2. The installed plugin package is a **real directory**, not a symlink.
+3. It is a git worktree **and** the install directory is that worktree's top level (not a subfolder of a
+   bigger repository).
+4. `origin` is an `https://` URL for `nesteacold/dsh-wiki` (`ssh://`, `git://`, `http://`, scp-style and local
+   paths are refused).
+5. The working tree is clean (`git status --porcelain` prints nothing), so uncommitted work is never touched.
+6. The published version is a strict `X.Y.Z` and **strictly newer** than the installed one — an equal or older
+   published version never installs (no downgrade).
+
+Then it runs `git fetch --tags --prune origin` and `git checkout --detach` to the tag `v<version>` (or
+`<version>`) if one exists, else to `origin/main`, and re-reads the local `package.json`: it must equal the
+published version, otherwise the previous revision is restored and `postcondition-failed` is reported. Every git
+call runs hardened: no credential helper, hooks directory pointed at an empty temporary folder, no submodule
+recursion, HTTPS only, no user or system git config, no interactive prompt. The request is
+`POST /dsh-wiki/api/update` with the body `{"confirm":"install-update"}`; without that exact token the update
+service is never called.
+
+**Reload to finish.** An applied update does **not** restart anything. The card says to reload the plugin, and
+`reloadRequired` stays `true` until the plugin is re-created.
+
+**Why a development install refuses.** An install that is a symlink — a plugin linked into the DSH profile from
+a development checkout — is refused with `install-is-development-link`, before any git command runs. Checking out
+a published version into the directory behind the link would overwrite that development tree, so neither the published-version check nor **Install update** runs there; the published version is fetched only for installs that pass every check before it (requirements 1-5).
+
+**Refusal reasons** are a closed set of 15 codes, each with one fixed sentence (no paths, git output or upstream
+text ever reach the client): `update-disabled`, `update-in-progress`, `install-not-found`,
+`install-is-development-link`, `install-not-git`, `install-not-worktree-root`, `install-origin-mismatch`,
+`install-dirty`, `latest-not-newer`, `version-invalid`, `network-unavailable`, `fetch-failed`,
+`checkout-failed`, `postcondition-failed`, `internal-error`. All are HTTP 409 except `internal-error` (500).
+
+**Manual equivalent** (what the button does, in a clean real checkout of the plugin):
+
+```sh
+git fetch --tags --prune origin
+git checkout --detach v<version>   # or the tag <version>, or origin/main when no tag exists
+```
+
+then reload the plugin. Configuration key: `update.enabled` (boolean, default `false`; it is the only `update`
+key and any other key is a configuration error). Known limit: the checkout/restore path has so far been verified
+against injected fakes, not against a real repository.
+
 ## ⚔️ vs Community Alternatives
 
 | | dsh-wiki | dsh-openwiki | dsh-plugin-codemap | archify |
@@ -300,6 +558,8 @@ Plugin row `config` (editable per-line in the GUI plugin page):
     buildTimeoutMs: 600000   # build subprocess timeout (10 min)
     selfcheckTimeoutMs: 600000
     pollMs: 500              # job supervisor poll interval
+    update:
+      enabled: false         # in-panel version check / self-update (see Updating); false = zero network
 ```
 
 The job-only settings (`pythonPath`, `jobTimeoutMs`, `buildTimeoutMs`, `selfcheckTimeoutMs`, `pollMs`)
@@ -314,7 +574,7 @@ Two separate language decisions: the **site chrome** (search placeholder, card l
 | Behavior | dsh-wiki |
 | --- | --- |
 | Uploads repo content / Git history | **never** |
-| Network requests (generation, diagrams, fonts, scripts) | **never** (zero-dep builder, zero-external-link site) |
+| Network requests (generation, diagrams, fonts, scripts) | **never** (zero-dep builder, zero-external-link site). The one opt-in exception is the version check/self-update (`update.enabled`, default `false`; see Updating and `SECURITY.md`) |
 | Reads `.git` object contents | **never** (sole exception: optional `git log --oneline -15` summary) |
 | Artifact location | local disk only |
 
@@ -323,28 +583,36 @@ Host-side route fence: loopback Host check + directory basename must equal `wiki
 ## 🧪 Tests
 
 ```sh
+# Counts measured 2026-11-11 on Windows with full file access; each suite prints its own tally.
 python3 tests/test_build_wiki_site.py   # 217 builder regression checks (injection PoCs, SVG sanitizing, config merge, node --check on site scripts, citation resolution incl. unique-basename fallback)
 python3 tests/test_wiki_translations.py # 113 translation-policy checks (structural SHA-256 per typed unit)
-node tools/harness-test.mjs             # 412 host-half checks (skill / commands / routes / trust fence / subagent paths, plus job-gate, language API and body-read response wiring)
-node tools/jobs-harness-test.mjs        # 192 module-level job checks (drives lib/jobs.js directly, incl. starved-deadline, chunked-overflow and hostile-input regressions)
+node tools/harness-test.mjs             # host-half checks (skill / commands / routes / trust fence / subagent paths, plus job-gate, language API and body-read response wiring, plus the five agent tools). Measured 2026-11-11 with full file access: 479 PASS / 0 FAIL / 0 SKIP. Where git is unavailable the two git-dependent blocks SKIP by design (measured: 472 PASS / 0 FAIL / 2 SKIP with git removed from PATH).
+node tools/mcp-test.mjs                 # MCP adapter checks (HTTP over a real socket, in-process stdio, resolution semantics, CLI default transport + flag fences via file-captured stdio). Measured 2026-11-11 with full file access: 110 passed / 0 skipped / 0 failed; the CLI-spawned and OS-pipe tiers report SKIP where the environment denies piped child processes.
+node tools/jobs-harness-test.mjs        # 202 module-level job checks (drives lib/jobs.js directly, incl. starved-deadline, chunked-overflow and hostile-input regressions)
 node tools/frontmatter-differential-test.mjs # 64 differential checks (58 front-matter shapes: the extracted JS reader vs the real python assemble reader; 0 leaks; exits 2 rather than passing when python is absent)
 node tools/jobs-worker-test.mjs         # 99 worker-pipeline checks (prompt/guard/journal/publish-executor/translate seeding)
-node tools/worker-protocol-test.mjs     # 64 protocol checks (1 POSIX-only case skipped on Windows)
-node tools/client-smoke.mjs <react> <react-dom>  # 145 client checks (grid/detail/cards, markdown safety, zoom + focus trap, model selector, language selector, job controls)
-node tools/readme-parity-test.mjs          # 114 README parity checks (EN is the source of truth; every README.<lang>.md must match its headings, byte-identical code blocks, facts, links and length)
+node tools/worker-protocol-test.mjs     # 64 protocol checks passed (65 cases; 1 POSIX-only case skips on Windows)
+node tools/client-smoke.mjs <react> <react-dom> # 155 client checks (grid/detail/cards, markdown safety, zoom + focus trap, model selector, language selector, job controls)
 node tools/journal-test.mjs             # 75 journal validator/planner checks (incl. the exported proof vocabulary)
 node tools/journal-store-test.mjs       # 86 journal-store checks (exclusive create, flush, rename, tamper refusal)
 node tools/publish-executor-test.mjs    # 27 publish/recovery-executor checks (incl. restart restore + explicit recovery flag)
 node tools/fs-contain-test.mjs          # 27 containment checks (canonical dir, identity, guarded rename)
 node tools/worker-guard-test.mjs        # 61 worker tool-guard checks
 node tools/host-liveness-test.mjs       # 26 host-liveness checks
+node tools/readme-parity-test.mjs       # 127 README parity checks (heading skeleton, byte-identical code blocks, fact tokens, links and anchors, line ratio, no machine paths — across every README translation)
+node tools/update-test.mjs              # 145 update checks (version check + safe self-update: enabled gate, symlink/dirty-tree/origin refusals, downgrade guard, no path or upstream text in payloads, never restarts, single-flight, hardened git config)
+node tools/update-ui-test.mjs <react> <react-dom> # 72 update UI checks (the Version card in every state rendered with real React; requests only on user action; install success only reports a reload)
+node tools/wiki-freshness-test.mjs      # 39 wiki-freshness checks (changedFiles excludes the wiki dir via git pathspec, stale/behind/unknown semantics, injected fake execFile — no git, no network)
+node tools/recovery-code-projection-test.mjs # 18 recovery-code projection checks (route PLAN_CODES / releaseReason allowlists re-derived from the producers, drift in either direction fails, fail-closed fallback kept)
 ```
+
+Each line above states the count its own suite prints, in that suite's own format: the two Python suites print `N/M passed`; a `node:test` suite reports `ℹ tests N / ℹ pass N / ℹ skipped N` (so `worker-protocol-test.mjs` declares 65 cases and skips 1 on Windows); the remaining harnesses print one `PASS` line per check and end with `ALL PASS`. There is deliberately **no single grand total**: a `PASS` line and a `node:test` case are different units, so adding them would yield a number with no defined meaning — and any fixed total goes stale the next time a suite grows. That is why the badge reads `all suites pass`. Re-run the block above to check any figure.
 
 ## ❓ FAQ
 
 **How is this different from DeepWiki (Cognition)?** DeepWiki is a hosted service — the repo leaves your machine. dsh-wiki uses the model in your local session; nothing leaves the machine and the artifact is an HTML file you can double-click.
 
-**Which DSH versions?** Peers declare `^0.1.1-rc.1 || ^0.2.0-rc.1`; verified on 0.2.2-rc.1 (the pinned engines.dsh). No 0.2.2-breaking APIs used (tools.resolve / tools.mode / Session Projection all avoided).
+**Which DSH versions?** Peers declare `^0.1.1-rc.1 || ^0.2.0-rc.1`; verified on 0.2.2-rc.1 (2026-11-04 latest). No 0.2.2-breaking APIs used (tools.resolve / tools.mode / Session Projection all avoided).
 
 **headless / tui profiles?** The skill and `/wiki view|list` work; `/wiki generate` and the local site routes need the web/desktop host (webServer).
 
