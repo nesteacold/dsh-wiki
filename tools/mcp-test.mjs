@@ -50,8 +50,16 @@ const logWarn = () => {};
 // ---------- 夹具 ----------
 const TEMP = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "dsh-wiki-mcp-")));
 const cleanupTemps = () => {
+  try { process.chdir(os.tmpdir()); } catch { /* 目录已不存在时 rmSync 照常处理 */ }
   try { fs.rmSync(TEMP, { recursive: true, force: true }); } catch { /* 锁住的目录不影响结果 */ }
 };
+
+// spec 021 R1 之后，服务器把**自己的工作目录**当作会话目录候选。进程内用例（以及不指定 cwd 的 CLI 子进程）
+// 因此会继承测试进程的 cwd —— 从仓库根运行时那是一个真正带 .dsh-wiki 的目录，会盖过夹具登记表，
+// 让“登记表决定结果”的旧断言变成“跑在哪个目录决定结果”。把测试进程固定在一个确定没有 wiki 的目录里，
+// 套件的结果就不再取决于从哪里启动；会话目录这一条另由 cwdCases 显式指定 cwd 来覆盖。
+const NEUTRAL_CWD = fs.mkdtempSync(path.join(TEMP, "neutral-cwd-"));
+process.chdir(NEUTRAL_CWD);
 
 const HUB_CHILDREN = Array.from({ length: 25 }, (_, index) => ({
   id: `hub-${String(index + 1).padStart(2, "0")}`,
@@ -715,13 +723,14 @@ function runCliCaptured(args, { timeoutMs = 15000 } = {}) {
 
 /** 起一个 `--transport http` 的 CLI 子进程，输出接普通文件（不用管道），等就绪行。
  *  http 是显式选入的路径，改了默认值以后必须继续证明它仍然能起来并应答。 */
-async function startCapturedHttp(args, { timeoutMs = 15000 } = {}) {
+async function startCapturedHttp(args, { timeoutMs = 15000, cwd } = {}) {
   const stamp = `${process.pid}-${Date.now()}-${++captureSeed}`;
   const outPath = path.join(TEMP, `http-${stamp}.out.txt`);
   const errPath = path.join(TEMP, `http-${stamp}.err.txt`);
   const outFd = fs.openSync(outPath, "w");
   const errFd = fs.openSync(errPath, "w");
-  const child = spawn(process.execPath, [SERVER, ...args], { stdio: ["ignore", outFd, errFd] });
+  // cwd 是 spec 021 R1 的被测输入：服务器以哪个目录启动，决定会话目录候选。
+  const child = spawn(process.execPath, [SERVER, ...args], { stdio: ["ignore", outFd, errFd], ...(cwd ? { cwd } : {}) });
   CHILDREN.add(child);
   const read = (file) => {
     try { return fs.readFileSync(file, "utf8"); } catch { return ""; }
@@ -810,6 +819,53 @@ async function cliDefaultCases() {
     && help.stdout.includes("--transport http only")
     && !/--transport http\b[^\n]*\(default\)/.test(help.stdout),
     `${help.code} ${JSON.stringify(help.stdout.slice(0, 400))}`);
+}
+
+// ---------- 层 3c：服务器工作目录即会话目录（spec 021 R1；真起进程，因为 cwd 是进程级状态） ----------
+async function cwdCases() {
+  // 登记表里有**两个**已发现根：如果会话目录没被用上，回落必然是 repo-ambiguous，所以这组断言有区分力。
+  const callStatus = async (cwd, args = [], home = homeAmbiguous) => {
+    const cli = await startCapturedHttp(["--transport", "http", "--port", String(await freePort()), "--dsh-home", home, ...args], { cwd });
+    try {
+      if (!cli.ready) return { started: false, text: cli.stderr().slice(0, 300) };
+      const status = await callTool(cli.ready.url, "wiki_status", {});
+      return { started: true, isError: status.json?.result?.isError, text: textOf(status) };
+    } finally {
+      await cli.stop();
+    }
+  };
+
+  // 夹具仓库 repo-c 故意**不在**登记表里：命中它只能来自会话目录，而不是已登记根。
+  const repoC = makeRepo("repo-c");
+  const fromCwd = await callStatus(repoC);
+  check("cwd: with no --repo, the directory the server starts in is used when it holds a wiki (not repo-ambiguous)",
+    fromCwd.started && fromCwd.isError === false
+    && fromCwd.text.includes(`repo: ${repoC}`)
+    && !fromCwd.text.includes("repo-ambiguous"),
+    JSON.stringify(fromCwd).slice(0, 300));
+
+  // 空登记表：没有任何回落可言，拒绝文案必须点名缺失的 wiki.json，且目录没有 wiki 就绝不成为默认目标。
+  const noWiki = await callStatus(noWikiDir, [], homeDry);
+  check("cwd: a start directory without a wiki is not adopted; the refusal names the missing wiki.json",
+    noWiki.started && noWiki.isError === true
+    && noWiki.text.includes("refused (repo-unknown)")
+    && noWiki.text.includes("wiki.json")
+    && !noWiki.text.includes(`repo: ${noWikiDir}`),
+    JSON.stringify(noWiki).slice(0, 300));
+
+  // 登记表里有两个根：没有 wiki 的启动目录不能把默认目标“挑”成其中任何一个，也不能是它自己。
+  const noWikiRegistry = await callStatus(noWikiDir);
+  check("cwd: a start directory without a wiki never binds to an unrelated registry root (stays repo-ambiguous)",
+    noWikiRegistry.started && noWikiRegistry.isError === true
+    && noWikiRegistry.text.includes("refused (repo-ambiguous)")
+    && !noWikiRegistry.text.includes(`repo: `),
+    JSON.stringify(noWikiRegistry).slice(0, 300));
+
+  // 显式 --repo 仍压过会话目录（解析顺序：显式 > 会话目录 > 唯一已发现根）。
+  const explicitWins = await callStatus(repoC, ["--repo", repoB]);
+  check("cwd: an explicit --repo still wins over the start directory",
+    explicitWins.started && explicitWins.isError === false && explicitWins.text.includes(`repo: ${repoB}`),
+    JSON.stringify(explicitWins).slice(0, 300));
 }
 
 // ---------- 层 3a：CLI 端到端（spawn 门控，需要管道） ----------
@@ -1086,6 +1142,7 @@ async function main() {
     await boundsCases();
     await timeoutCases();
     await cliDefaultCases();
+    await cwdCases();
 
     if (spawnSupported()) {
       await cliCases();

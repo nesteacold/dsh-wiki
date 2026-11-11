@@ -107,9 +107,15 @@ export function createMcpServer({
     // 适配层的 `--repo` 只是“调用方省略 repo 时的默认候选”，仍然要过 resolveRepo 的同一条证明；
     // 工具自己的解析顺序（显式 > 会话目录 > 唯一已发现根）不变。
     if (!args.repo && typeof defaultRepo === "string" && defaultRepo.length > 0) args.repo = defaultRepo;
+    // 会话目录候选（spec 021 R1）：MCP 没有 Host 的 exec 上下文，所以把**本进程的工作目录**作为
+    // 最小等价物交出去 —— `sessionCwdOf` 认 `exec.cwd`。Claude Code 以项目目录为 cwd 拉起 stdio 服务器
+    // （实测），于是不带 `--repo` 的便携注册也能落到当前仓库。它与 Host 内一样只是**候选**：
+    // wiki-context 的 resolveRepo 仍要求该目录真的含 <wikiDir>/wiki.json（或是已登记根），
+    // 没有 wiki 的目录不会变成默认目标；显式 repo（含 `--repo`）优先级不变。
+    const exec = { cwd: process.cwd() };
     let value;
     try {
-      value = await definition.execute(args, undefined);
+      value = await definition.execute(args, exec);
     } catch (error) {
       deps.logWarn(`dsh-wiki mcp: ${name} failed: ${String(error?.message ?? error)}`);
       throw new RpcFailure(RPC.internalError, "the wiki tool could not complete this request");
