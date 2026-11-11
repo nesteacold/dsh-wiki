@@ -20,7 +20,7 @@
     <img src="docs/assets/badges/license.svg" alt="MIT License">
     <img src="docs/assets/badges/dsh.svg" alt="DSH 0.2.x compatible">
     <img src="docs/assets/badges/python.svg" alt="Python ≥3.7">
-    <img src="docs/assets/badges/tests.svg" alt="tests: 217 builder, 113 translation, 412 host, 192 module job, 64 differential, 99 worker pipeline, 64 protocol, 145 client, 302 trusted-journal/containment/guard/liveness checks">
+    <img src="docs/assets/badges/tests.svg" alt="tests: 217 builder, 113 translation, 412 host, 192 module job, 64 differential, 99 worker pipeline, 64 protocol, 145 client, 114 readme parity, 302 trusted-journal/containment/guard/liveness checks">
     <img src="docs/assets/badges/network.svg" alt="zero network">
   </p>
 
@@ -35,7 +35,7 @@
 > # this repository IS the plugin package — clone it and point DSH at the checkout
 > REPO="<path to this repo checkout>"
 > CLI="<path to DSH>/runtime/cli/bin/dsh"        # e.g. "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
->                                               # or  "C:\Users\<you>\AppData\Local\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh"
+>                                               # or  "%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh"
 > "$CLI" plugin --profile desktop add "$REPO"
 > ```
 
@@ -50,7 +50,7 @@ web/desktop profile it gives you four entries:
 
 | Entry | Shape | Notes |
 | --- | --- | --- |
-| **`dsh-wiki` skill** | runtime skill | Say "generate a wiki for this repo" and the 5-phase protocol takes over: inventory → config resolution → language detection → page-tree planning → per-page writing → build + selfcheck |
+| **`dsh-wiki` skill** | runtime skill | Say "generate a wiki for this repo" and the phased protocol takes over (Phase 0 inventory → Phase 5 report): inventory → config resolution → language detection → page-tree planning → per-page writing → build + selfcheck |
 | **`/wiki` command** | slash command | `/wiki generate [path]` (runs in a fork subagent), `/wiki view` (prints the local site URL), `/wiki list` |
 | **📚 Sidebar Wiki panel** | left sidebar global panel | A new 📖 row in the sidebar: click to list every built wiki, pick one and the site is read right inside the app (refresh / back to list / pop-out) |
 | **📖 Wiki button** | session-header slot | Opens the local index page in a standalone window (when you don't want to leave the conversation) |
@@ -151,7 +151,7 @@ with the wrong action is 400 `incremental-not-for-generate` / `incremental-not-f
 `incremental-up-to-date`, `incremental-id-mismatch`, `incremental-unexpected-write`. Two of these exist
 because a caller who asked for incremental and silently received a full rebuild has been lied to.
 
-Two safety properties are worth stating plainly:
+Three safety properties are worth stating plainly:
 
 - **The staging tree is seeded from the live wiki, and a failed seed is a hard failure.** Publication
   replaces the live tree, so a missing seed would make the wiki *shrink*.
@@ -189,7 +189,8 @@ comparison.
 Measured limit, stated so nobody over-reads the feature: on the only real corpus available
 (`DXVK_Project`, `dd02d64..67a1131`) 116 changed files mapped to **23 of 31 pages and 9 of 25 cards**,
 with 102 files mapped to no page at all. For a wiki that has drifted far, incremental is barely cheaper
-than a full rebuild, and `.dsh-wiki/` is itself committed, so a wiki update also shows up in the diff.
+than a full rebuild. In that corpus `.dsh-wiki/` is itself committed, so a wiki update also shows up in
+the diff — this repository ignores it instead (`.gitignore`), which is the recommended setting.
 
 Why the gate: a background job would run an ordinary model session with **no filesystem isolation**
 ("do not touch the live `.dsh-wiki`" is a prompt-level rule, not a sandbox), and the former read routes
@@ -238,11 +239,6 @@ decisions are not gated by `recovery: true` (they never advance a record, but th
 proof); Windows durability is still `"file-flushed"`, not dir-synced; and this route has never been
 exercised end to end over HTTP at any revision. **Treat post-restart recovery as unreviewed until an
 independent verdict is written down.**
-
-
-
-
-
 
 The implementation is still in the tree (`lib/jobs.js`): staging publication, canonical-`en` language
 gate, protected host-owned `config.json`/`locales/`, single-flight fence, cancel/quarantine, bounded
@@ -335,6 +331,7 @@ node tools/frontmatter-differential-test.mjs # 64 differential checks (58 front-
 node tools/jobs-worker-test.mjs         # 99 worker-pipeline checks (prompt/guard/journal/publish-executor/translate seeding)
 node tools/worker-protocol-test.mjs     # 64 protocol checks (1 POSIX-only case skipped on Windows)
 node tools/client-smoke.mjs <react> <react-dom>  # 145 client checks (grid/detail/cards, markdown safety, zoom + focus trap, model selector, language selector, job controls)
+node tools/readme-parity-test.mjs          # 114 README parity checks (EN is the source of truth; every README.<lang>.md must match its headings, byte-identical code blocks, facts, links and length)
 node tools/journal-test.mjs             # 75 journal validator/planner checks (incl. the exported proof vocabulary)
 node tools/journal-store-test.mjs       # 86 journal-store checks (exclusive create, flush, rename, tamper refusal)
 node tools/publish-executor-test.mjs    # 27 publish/recovery-executor checks (incl. restart restore + explicit recovery flag)
@@ -347,7 +344,7 @@ node tools/host-liveness-test.mjs       # 26 host-liveness checks
 
 **How is this different from DeepWiki (Cognition)?** DeepWiki is a hosted service — the repo leaves your machine. dsh-wiki uses the model in your local session; nothing leaves the machine and the artifact is an HTML file you can double-click.
 
-**Which DSH versions?** Peers declare `^0.1.1-rc.1 || ^0.2.0-rc.1`; verified on 0.2.2-rc.1 (2026-11-04 latest). No 0.2.2-breaking APIs used (tools.resolve / tools.mode / Session Projection all avoided).
+**Which DSH versions?** Peers declare `^0.1.1-rc.1 || ^0.2.0-rc.1`; verified on 0.2.2-rc.1 (the pinned engines.dsh). No 0.2.2-breaking APIs used (tools.resolve / tools.mode / Session Projection all avoided).
 
 **headless / tui profiles?** The skill and `/wiki view|list` work; `/wiki generate` and the local site routes need the web/desktop host (webServer).
 
