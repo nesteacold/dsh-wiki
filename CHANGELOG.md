@@ -11,7 +11,19 @@
   `UPSTREAM.md`），这三次的安全与健壮性修复是审计本仓库代码的前提。上游 v0.2.0、v0.2.1
   两个 tag 里没有 `CHANGELOG.md`，其条目是在 v0.2.2 时补写的。
 
-## 0.3.2 — 未发布（spec `specs/016-wiki-self-update`；修复一个让自更新永远无法成功的缺陷）
+## 0.3.3 — 2026-11-12（spec 022；版本卡片说对了“怎样才算更新完成”）
+
+- **修正**：更新成功后，版本卡片原来提示“Reload the plugin to finish.”，但 DSH 没有单插件重载：
+  `reloadRequired` 只会被新的插件实例清除（`lib/update.js:418-421`）。现在卡片提示
+  **“Restart DSH to finish.”**（中文“重启 DSH 以完成。”），三份 README 同步改写并说明原因。
+  路由、原因码、预检顺序、网络行为一概未改。
+- **测试**：`tools/update-ui-test.mjs` 72 → 73 项（新增一项锁定两种语言的新句子）；“面板从不声称自己重启了
+  什么”的守卫被收窄而非删除——只剥离那一句指令，其余仍按原禁词检查。
+- **测试稳定性**：`tools/jobs-worker-test.mjs` 的三项“发布截止”测试改为从到达被测阶段起计时，不会再因为
+  前面阶段慢而以错误的理由通过；没有删除或放宽任何断言。该套件在高负载机器上仍有与本改动无关的既有抖动。
+- **升级**：0.3.2 开启 `update.enabled: true` 的安装可以直接用面板升到 0.3.3；装好后**重启 DSH**。
+
+## 0.3.2 — 2026-11-11（spec `specs/016-wiki-self-update`；修复一个让自更新永远无法成功的缺陷）
 
 - **缺陷**：对已发布的 `v0.3.1`（附注标签 annotated tag）做真实 git 演练，`apply()` 每次都返回
   `postcondition-failed` 并恢复原修订。原因：对附注标签，`git rev-parse refs/tags/v<ver>` 给出的是
