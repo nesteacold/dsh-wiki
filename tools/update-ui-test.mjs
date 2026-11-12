@@ -1,6 +1,6 @@
 // dsh-wiki 面板的版本卡片离线测试（spec 016 §3.6）：用真实 React 渲染卡片的每一个状态，
 // 用假 fetch + 罐装 hook 状态驱动 useUpdateStatus / useUpdateApply，验证“只在用户动作时才请求”
-// 和“安装成功只说需要重启插件”。用法：
+// 和“安装成功只说需要重启 DSH 才算完成”（spec 022 §3.1）。用法：
 //   node tools/update-ui-test.mjs <react 包目录> <react-dom 包目录>
 // 没有 React 时打印 SKIP 并退出 0（与 client-smoke.mjs 相同的约定，无依赖的扫描里也是安全的）。
 import { readFileSync } from "node:fs";
@@ -106,6 +106,10 @@ const blockedRaw = (code) => ({ ok: true, enabled: true, installed: { version: "
 // 探针拆成两段拼接：一条断言“源码里不含某个标识符”的检查，若把那个标识符原样写进来，自己就会失败。
 const HAND_COPY = "SPEC_" + "REASONS";
 
+// 022 §3.1：完成这一步是重启 DSH，不是重载插件 —— DSH 根本没有单插件重载，`reloadRequired` 只有新的
+// 插件实例才会清（`lib/update.js:418-421`）。这里写**字面量**，所以只改字典不改这条断言会失败。
+const RESTART_INSTRUCTION = "Restart DSH to finish.";
+
 // ================= 字典与构建约束 =================
 {
   const en = DICT.en, zh = DICT.zh;
@@ -118,6 +122,11 @@ const HAND_COPY = "SPEC_" + "REASONS";
   check("dictionary: every new key is a version-card key (nothing leaked into other namespaces)",
     enKeys.filter((k) => /^upd\./.test(k)).length >= 20 && enKeys.filter((k) => /^upd\./.test(k)).every((k) => /^upd\./.test(k)),
     String(enKeys.filter((k) => /^upd\./.test(k)).length));
+  // 022 §4 T4：完成一步的两种语言都必须说出**重启 DSH**（旧说法“重载插件”在 DSH 里做不到）
+  check("dictionary: the finish step names a DSH restart in both languages (en + zh literal)",
+    en["upd.reload"] === RESTART_INSTRUCTION && zh["upd.reload"] === "重启 DSH 以完成。"
+    && !/reload the plugin|重启插件/i.test(en["upd.reload"] + zh["upd.reload"]),
+    JSON.stringify({ en: en["upd.reload"], zh: zh["upd.reload"] }));
 
   const clientReasons = [...mod._test.UPDATE_REASONS];
   const hostReasons = [...REASON_CODES];
@@ -281,9 +290,12 @@ const HAND_COPY = "SPEC_" + "REASONS";
   const text = textOf(applied);
   check("applied: reports from → to and that a reload is required",
     text.includes("0.3.0 → 0.4.0") && text.includes(t("upd.reload"))
-    && /Reload the plugin to finish/.test(text), text);
+    && text.includes(RESTART_INSTRUCTION), text);
+  // 022 §3.1/§4 T3：这条守卫被**收窄**过，不是删掉了。做法是：先把唯一允许的那句**指令**摘掉，再对剩下的
+  // 文字跑原来的整组禁词（restart / restarted / reloaded the plugin / automatically）。所以 “Restart DSH to
+  // finish.” 放行，而任何自称“已经/将要自动重启”的说法仍在原地被拒绝 —— 既没删检查也没放宽到只认过去式。
   check("applied: never claims a restart happened, and Update cannot be pressed again",
-    !/restart|restarted|reloaded the plugin|automatically/i.test(text)
+    !/restart|restarted|reloaded the plugin|automatically/i.test(text.split(RESTART_INSTRUCTION).join(""))
     && isDisabled(findBtn(applied, t("upd.update"))), text);
   // 装好之后用户可能再按一次 Check：重启提示不能被“正在检查”挤掉（检查中由禁用按钮自己表达）
   const appliedChecking = render({ phase: "loading", status: mod._test.updateStatusFrom(RAW.canUpdate) },
@@ -291,10 +303,11 @@ const HAND_COPY = "SPEC_" + "REASONS";
   check("applied: the reload instruction survives a follow-up check (it never flickers away)",
     textOf(appliedChecking).includes(t("upd.reload")) && textOf(appliedChecking).includes("0.3.0 → 0.4.0")
     && isDisabled(findBtn(appliedChecking, t("upd.check"))), textOf(appliedChecking));
-  // 宿主自己带着 reloadRequired:true 回来（上一次安装还没重启）：面板重开也能说出来
+  // 022 §4 T2：reopen 状态（宿主在面板重开时仍报 reloadRequired:true）说同一句话，且是字面量
   const pendingReload = render(ready({ ...RAW.upToDate, reloadRequired: true }), IDLE);
   check("applied: a status that still requires a reload says so after the panel is reopened",
-    textOf(pendingReload).includes(t("upd.reload")) && textOf(pendingReload).includes(t("upd.applied")),
+    textOf(pendingReload).includes(t("upd.reload")) && textOf(pendingReload).includes(RESTART_INSTRUCTION)
+    && textOf(pendingReload).includes(t("upd.applied")),
     textOf(pendingReload));
 }
 
@@ -486,8 +499,8 @@ let mountResult = null;
     d.apply().phase === "applied" && d.apply().from === "0.3.0" && d.apply().to === "0.4.0" && !!out,
     JSON.stringify(d.apply()));
   const html = render(ready(RAW.canUpdate), d.apply());
-  check("update: the applied card tells the owner to reload the plugin, and nothing else",
-    textOf(html).includes("0.3.0 → 0.4.0") && textOf(html).includes("Reload the plugin to finish"),
+  check("update: the applied card tells the owner to restart DSH, and nothing else",
+    textOf(html).includes("0.3.0 → 0.4.0") && textOf(html).includes(RESTART_INSTRUCTION),
     textOf(html));
 }
 {

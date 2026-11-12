@@ -508,8 +508,10 @@ recursion, HTTPS only, no user or system git config, no interactive prompt. The 
 `POST /dsh-wiki/api/update` with the body `{"confirm":"install-update"}`; without that exact token the update
 service is never called.
 
-**Reload to finish.** An applied update does **not** restart anything. The card says to reload the plugin, and
-`reloadRequired` stays `true` until the plugin is re-created.
+**Restart DSH to finish.** An applied update does **not** restart anything. The card says to restart DSH, and
+`reloadRequired` stays `true` until the plugin is re-created — DSH has no per-plugin reload (its `patchReload: live`
+re-reads the patch layer without re-instantiating a plugin), and a new plugin instance is exactly what clears the
+flag (`lib/update.js:418-421`), so a DSH restart is the supported step.
 
 **Why a development install refuses.** An install that is a symlink — a plugin linked into the DSH profile from
 a development checkout — is refused with `install-is-development-link`, before any git command runs. Checking out
@@ -528,7 +530,7 @@ git fetch --tags --prune origin
 git checkout --detach v<version>   # or the tag <version>, or origin/main when no tag exists
 ```
 
-then reload the plugin. An install of 0.3.1 cannot update itself through the panel: 0.3.1 has an annotated-tag defect (the postcondition compared HEAD with the unpeeled tag-object id, so every update was refused with `postcondition-failed` and restored), fixed in 0.3.2. To go from 0.3.1 to 0.3.2, use this manual equivalent with `v0.3.2`. Configuration key: `update.enabled` (boolean, default `false`; it is the only `update`
+then restart DSH. An install of 0.3.1 cannot update itself through the panel: 0.3.1 has an annotated-tag defect (the postcondition compared HEAD with the unpeeled tag-object id, so every update was refused with `postcondition-failed` and restored), fixed in 0.3.2. To go from 0.3.1 to 0.3.2, use this manual equivalent with `v0.3.2`. Configuration key: `update.enabled` (boolean, default `false`; it is the only `update`
 key and any other key is a configuration error). Known limit: the checkout/restore path has so far been verified
 against injected fakes, not against a real repository.
 
@@ -602,7 +604,7 @@ node tools/worker-guard-test.mjs        # 61 worker tool-guard checks
 node tools/host-liveness-test.mjs       # 26 host-liveness checks
 node tools/readme-parity-test.mjs       # 127 README parity checks (heading skeleton, byte-identical code blocks, fact tokens, links and anchors, line ratio, no machine paths — across every README translation)
 node tools/update-test.mjs              # 150 update checks (version check + safe self-update: enabled gate, symlink/dirty-tree/origin refusals, downgrade guard, no path or upstream text in payloads, never restarts, single-flight, hardened git config)
-node tools/update-ui-test.mjs <react> <react-dom> # 72 update UI checks (the Version card in every state rendered with real React; requests only on user action; install success only reports a reload)
+node tools/update-ui-test.mjs <react> <react-dom> # 73 update UI checks (the Version card in every state rendered with real React; requests only on user action; install success only says to restart DSH, never that anything was restarted)
 node tools/wiki-freshness-test.mjs      # 39 wiki-freshness checks (changedFiles excludes the wiki dir via git pathspec, stale/behind/unknown semantics, injected fake execFile — no git, no network)
 node tools/recovery-code-projection-test.mjs # 18 recovery-code projection checks (route PLAN_CODES / releaseReason allowlists re-derived from the producers, drift in either direction fails, fail-closed fallback kept)
 ```
