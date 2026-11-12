@@ -222,20 +222,20 @@ Phạm vi quan trọng với việc phê duyệt: một entry **user-scope** đ�
 `.mcp.json` ở project vẫn ở trạng thái `⏸ Pending approval` cho tới khi bạn duyệt — nên một repository vừa
 clone không thể âm thầm khởi động một server.
 
-Các lệnh thô tương đương, nếu bạn thích tự gõ (thay `<path-to-checkout>` bằng đường dẫn tuyệt đối của checkout). User scope:
+Các lệnh thô tương đương, nếu bạn thích tự gõ. Repo này **chính là** package, nên server nằm ở `mcp/server.mjs` (không có cấp `plugins/dsh-wiki/` ở đây); `<path-to-dsh-wiki>` là nơi bạn clone nó, `<path-to-your-repo>` là repo có wiki bạn muốn phục vụ. User scope:
 
 ```sh
-claude mcp add dsh-wiki -- node "<path-to-checkout>\plugins\dsh-wiki\mcp\server.mjs" --repo "<path-to-checkout>"
+claude mcp add dsh-wiki -s user -- node "<path-to-dsh-wiki>\mcp\server.mjs" --repo "<path-to-your-repo>"
 ```
 
-Project scope (`.mcp.json`, đường dẫn Windows được escape cho JSON; `type` là thứ Claude Code ghi). **Đừng commit
+Project scope (`.mcp.json`). **Đừng commit
 file này:** `--repo` phải là đường dẫn tuyệt đối (`mcp/server.mjs:120` từ chối mọi thứ khác) và `command` nêu
 node của máy này, nên một `.mcp.json` đã commit là sai trên mọi máy khác và mục khi node di chuyển. User scope
 đã phủ mọi project, đó là lý do một file project thường là không cần thiết — hãy sinh nó theo từng máy bằng
-`--scope project` nếu bạn muốn, và thêm `.mcp.json` vào `.gitignore`:
+`--scope project` nếu bạn muốn, và thêm `.mcp.json` vào `.gitignore`. (`${CLAUDE_PROJECT_DIR}` **không** được expand trong `.mcp.json` — đã đo — nên nó cũng không làm file portable được. Lưu ý dạng không có `--repo` bên dưới: bỏ `--repo` thì server dùng thư mục Claude Code khởi chạy nó, và thư mục đó phải chứa `<wikiDir>/wiki.json` mới được chấp nhận, nên nó không thể bind nhầm repo):
 
 ```json
-{ "mcpServers": { "dsh-wiki": { "type": "stdio", "command": "node", "args": ["<path-to-checkout>\\plugins\\dsh-wiki\\mcp\\server.mjs", "--repo", "<path-to-checkout>"] } } }
+{ "mcpServers": { "dsh-wiki": { "type": "stdio", "command": "node", "args": ["<path-to-dsh-wiki>\\mcp\\server.mjs", "--repo", "<path-to-your-repo>"] } } }
 ```
 
 **Claude Desktop** giữ danh sách riêng tại `%APPDATA%\Claude\claude_desktop_config.json` (`~/Library/

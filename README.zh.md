@@ -193,19 +193,19 @@ node tools/register-mcp.mjs --uninstall --apply
 
 范围对批准流程很重要：**用户级**条目被信任并立即连接，而项目里的 `.mcp.json` 条目会一直处于 `⏸ Pending approval`，直到你批准——所以克隆下来的仓库无法悄悄启动一个服务器。
 
-如果你更愿意手敲，原始等价命令如下（把 `<path-to-checkout>` 换成检出目录的绝对路径）。用户级：
+如果你更愿意手敲，原始等价命令如下。本仓库**就是**这个 package，所以服务器在 `mcp/server.mjs`（这里没有 `plugins/dsh-wiki/` 这一层）；`<path-to-dsh-wiki>` 是你 clone 它的位置，`<path-to-your-repo>` 是你要服务的仓库。用户级：
 
 ```sh
-claude mcp add dsh-wiki -- node "<path-to-checkout>\plugins\dsh-wiki\mcp\server.mjs" --repo "<path-to-checkout>"
+claude mcp add dsh-wiki -s user -- node "<path-to-dsh-wiki>\mcp\server.mjs" --repo "<path-to-your-repo>"
 ```
 
-项目级（`.mcp.json`，Windows 路径为 JSON 做了转义；
+项目级（`.mcp.json`）。
 `type` 是 Claude Code 写入的）。
 **不要提交这个文件：** `--repo` 必须是绝对路径（`mcp/server.mjs:120` 拒绝其他任何形式），`command` 写的是这台机器的 node，所以提交进去的 `.mcp.json` 在其他任何机器上都是错的，node 一挪位置就失效。
-用户级已经覆盖所有项目，这也是项目级文件通常没必要的原因——如果你想要，用 `--scope project` 按机器生成，并把 `.mcp.json` 加进 `.gitignore`：
+用户级已经覆盖所有项目，这也是项目级文件通常没必要的原因——如果你想要，用 `--scope project` 按机器生成，并把 `.mcp.json` 加进 `.gitignore`。（`${CLAUDE_PROJECT_DIR}` 在 `.mcp.json` 中**不会**展开——实测——所以它同样无法让文件便携。注意下面的无 `--repo` 写法：不传 `--repo` 时服务器用 Claude Code 启动它的目录，该目录必须包含 `<wikiDir>/wiki.json` 才会被接受，因此不会绑定到错误的仓库）：
 
 ```json
-{ "mcpServers": { "dsh-wiki": { "type": "stdio", "command": "node", "args": ["<path-to-checkout>\\plugins\\dsh-wiki\\mcp\\server.mjs", "--repo", "<path-to-checkout>"] } } }
+{ "mcpServers": { "dsh-wiki": { "type": "stdio", "command": "node", "args": ["<path-to-dsh-wiki>\\mcp\\server.mjs", "--repo", "<path-to-your-repo>"] } } }
 ```
 
 **Claude Desktop** 在 `%APPDATA%\Claude\claude_desktop_config.json`（macOS 上是 `~/Library/

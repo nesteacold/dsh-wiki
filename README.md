@@ -210,21 +210,23 @@ Scope matters for approval: a **user-scope** entry is trusted and connects immed
 project `.mcp.json` entry stays `⏸ Pending approval` until you approve it — so a cloned repository
 cannot silently start a server.
 
-The raw equivalents, if you prefer typing them (replace `<path-to-checkout>` with the absolute path of your checkout). User scope:
+The raw equivalents, if you prefer typing them. This repository **is** the package, so the server is at `mcp/server.mjs` (there is no `plugins/dsh-wiki/` level here); `<path-to-dsh-wiki>` is where you cloned it, and `<path-to-your-repo>` is the repository whose wiki you want to serve. User scope:
 
 ```sh
-claude mcp add dsh-wiki -- node "<path-to-checkout>\plugins\dsh-wiki\mcp\server.mjs" --repo "<path-to-checkout>"
+claude mcp add dsh-wiki -s user -- node "<path-to-dsh-wiki>\mcp\server.mjs" --repo "<path-to-your-repo>"
 ```
 
-Project scope (`.mcp.json`, Windows path escaped for JSON; `type` is what Claude Code writes). **Do not
-commit this file:** `--repo` must be an absolute path (`mcp/server.mjs:120` rejects anything else) and
-`command` names this machine's node, so a committed `.mcp.json` is wrong on every other machine and rots
-when node moves. User scope already covers every project, which is why a project file is normally
-unnecessary — generate it per machine with `--scope project` if you want it, and add `.mcp.json` to
-`.gitignore`:
+Project scope (`.mcp.json`). **Do not commit this file:** `--repo` must be an absolute path
+(`mcp/server.mjs:120` rejects anything else) and `command` names this machine's node, so a committed
+`.mcp.json` is wrong on every other machine and rots when node moves. (`${CLAUDE_PROJECT_DIR}` is
+**not** expanded in `.mcp.json`, measured, so it cannot make the file portable either.) User scope
+already covers every project, which is why a project file is normally unnecessary — generate it per
+machine with `--scope project` if you want it, and add `.mcp.json` to `.gitignore`. Note the second
+`--repo` form below: passing **no** `--repo` lets the server use the directory Claude Code starts it
+in (it has to contain `<wikiDir>/wiki.json` to be accepted, so it can never bind the wrong repo):
 
 ```json
-{ "mcpServers": { "dsh-wiki": { "type": "stdio", "command": "node", "args": ["<path-to-checkout>\\plugins\\dsh-wiki\\mcp\\server.mjs", "--repo", "<path-to-checkout>"] } } }
+{ "mcpServers": { "dsh-wiki": { "type": "stdio", "command": "node", "args": ["<path-to-dsh-wiki>\\mcp\\server.mjs", "--repo", "<path-to-your-repo>"] } } }
 ```
 
 **Claude Desktop** keeps its own list at `%APPDATA%\Claude\claude_desktop_config.json` (`~/Library/
