@@ -1754,12 +1754,34 @@ const sleepPastDeadline = async (manager, root, overshootMs) => {
   if (wait > 0) await sleep(wait);
 };
 /**
+ * Hold the journal write of the current phase until this job's deadline has expired and then
+ * `overshootMs` more, i.e. until deadlineAt + overshootMs. Unlike sleepPastDeadline it reads no
+ * absolute clock: the wait is measured from the deadlineAt the job wrote when it reached that phase,
+ * so an earlier slow phase (a cold filesystem, a loaded machine) cannot make the deadline expire
+ * before the phase the case is about has run — and a fast Phase-2 check in lib/jobs.js can never be
+ * read as this held phase. `waited` is the real time spent holding and `deadlineAfterArrival` the
+ * deadline that was left when the phase was reached; the callers assert on both.
+ */
+const holdPastDeadline = async (manager, root, overshootMs) => {
+  const startedAt = Date.parse(manager.view(root).active?.startedAt ?? "");
+  assert.ok(Number.isFinite(startedAt), "the running job must expose its startedAt");
+  const arriveAt = Date.now();
+  const deadlineAt = startedAt + PUBLISH_BUDGET_MS;
+  await sleep(Math.max(0, deadlineAt + overshootMs - Date.now()));
+  // Stamped as the sleep returns, before any observation stops the clock at this margins size.
+  const finishedAt = Date.now();
+  return { waited: finishedAt - arriveAt, deadlineAfterArrival: deadlineAt - arriveAt, finishedAt, deadlineAt };
+};
+/**
  * Run one publication whose journal write of `slowPhase` finishes past the deadline.
  * @param {string} slowPhase "validated" (before publication) or "live-moved" (before promotion)
- * @param {number} overshootMs how far past the deadline the write finishes
- * @param {{liveBefore?: boolean}} options liveBefore=false => first generation
+ * @param {number} overshootMs how far past the deadline the write finishes (both modes)
+ * @param {{liveBefore?: boolean, hold?: boolean}} options liveBefore=false => first generation;
+ *   hold=true holds from the arrival at slowPhase until deadlineAt + overshootMs instead of waiting
+ *   from startedAt, and returns the margin in `held` so the case can prove the deadline expired
+ *   while slowPhase was the phase in flight
  */
-const runDeadlinePublication = async (slowPhase, overshootMs, { liveBefore = true } = {}) => {
+const runDeadlinePublication = async (slowPhase, overshootMs, { liveBefore = true, hold = false } = {}) => {
   const host = makeHost({ onFollowup: (a, _m, s) => completeTurn(a, s) });
   const root = tempDir("dsh-wiki-wk-");
   if (liveBefore) writeLiveWiki(root);
@@ -1767,9 +1789,18 @@ const runDeadlinePublication = async (slowPhase, overshootMs, { liveBefore = tru
   const liveIdentityBefore = liveBefore ? await identityOf(liveDir) : null;
   const atPhase = {};
   let journaled;
+  let held = null;
   const fixture = await journalFixture(root, {
     onAdvance: async (next) => {
-      if (next.phase === slowPhase) await sleepPastDeadline(journaled, root, overshootMs);
+      if (next.phase !== slowPhase) return;
+      if (!hold) {
+        await sleepPastDeadline(journaled, root, overshootMs);
+        return;
+      }
+      // The release is stamped at the end of that sleep, so `finishedAt - deadlineAt` is the real
+      // lateness. Any overshoot >= 1 ms ends after the deadline, so the in-lock re-check — never a
+      // check made before this phase — is what must decide the outcome.
+      held = await holdPastDeadline(journaled, root, overshootMs);
     },
     afterAdvance: async (next) => {
       // What the disk looked like at the moment each phase became durable: staging must never be
@@ -1789,7 +1820,7 @@ const runDeadlinePublication = async (slowPhase, overshootMs, { liveBefore = tru
   startJob(journaled, root);
   const last = await finish(journaled, root, 15000);
   return {
-    root, last, calls: fixture.calls, store: fixture.store, manager: journaled, host, atPhase,
+    root, last, calls: fixture.calls, store: fixture.store, manager: journaled, host, atPhase, held,
     fixtureOptions: fixture.managerOptions,
     liveDir, liveIdentityBefore,
     liveIdentityAfter: existsSync(liveDir) ? await identityOf(liveDir) : null,
@@ -1801,7 +1832,17 @@ const runDeadlinePublication = async (slowPhase, overshootMs, { liveBefore = tru
 };
 
 test("publication deadline: an expiry re-checked inside the lock refuses the first rename", async () => {
-  const run = await runDeadlinePublication("validated", 250);
+  // The expiry has to happen AFTER the check before advanceJournal("validated"), so the in-lock re-check
+  // is what refuses the rename. Timing it from startedAt let a slow run (validation, scan, release of
+  // the worker) spend the whole budget first and then trip the pre-validated check instead; the same
+  // store hook cannot be skipped, so this is deterministic rather than merely likely.
+  const run = await runDeadlinePublication("validated", 1, { hold: true });
+  assert.ok(run.held.deadlineAfterArrival > 0,
+    `the deadline must be in the future when "validated" is reached; only ${run.held.deadlineAfterArrival} ms were left`);
+  assert.ok(run.held.waited >= run.held.deadlineAfterArrival,
+    `the journal write must finish past the job's deadline (waited ${run.held.waited} ms, deadline was in ${run.held.deadlineAfterArrival} ms)`);
+  assert.ok(run.held.finishedAt > run.held.deadlineAt,
+    `the write must finish past the deadline; it finished ${run.held.finishedAt - run.held.deadlineAt} ms past it`);
   assert.equal(run.last.phase, "failed", JSON.stringify(run.last));
   assert.equal(run.last.error.code, "job-timeout");
   assert.equal(run.last.published, false);
@@ -1839,10 +1880,29 @@ test("publication deadline: a journal write that overshoots the deadline gets on
     calls: ["load", "create:created", "advance:worker-running", "advance:worker-stopped", "advance:validated", "advance:aborted"],
   };
   // Not a race against a timer: the decision is taken AFTER the write returns, so two very different
-  // overshoots produce the same state instead of a timing-dependent one.
-  assert.deepEqual(shape(await runDeadlinePublication("validated", 50)), expected);
-  assert.deepEqual(shape(await runDeadlinePublication("validated", 750)), expected,
-    "the outcome does not depend on how late the journal write finished");
+  // overshoots (50 ms and 750 ms past the deadline) produce the same state instead of a timing-dependent
+  // one. Each run holds from its own arrival at "validated" (same reason as the first rename case: a
+  // fast pre-validated check must never be what a slow run reads), and the margin proves the deadline
+  // expired while that write was in flight.
+  const lateness = {};
+  const runs = { late: 50, later: 750 };
+  for (const [name, overshoot] of Object.entries(runs)) {
+    const run = await runDeadlinePublication("validated", overshoot, { hold: true });
+    assert.ok(run.held.deadlineAfterArrival > 0,
+      `the deadline must be in the future when "validated" is reached; only ${run.held.deadlineAfterArrival} ms were left`);
+    assert.ok(run.held.waited >= run.held.deadlineAfterArrival,
+      `the journal write must finish past the job's deadline (waited ${run.held.waited} ms, deadline was in ${run.held.deadlineAfterArrival} ms)`);
+    // Every hold that frees the write at deadlineAt + 1 ms or later is late; a hold sized for
+    // `overshoot` is late by about that much (Date.now() resolves 1-2 ms, so do not pin the exact value).
+    lateness[name] = run.held.finishedAt - run.held.deadlineAt;
+    assert.ok(lateness[name] > 0 && lateness[name] >= overshoot - 2,
+      `the ${name} write finished ${lateness[name]} ms past the deadline; it was held for ${overshoot} ms`);
+    assert.deepEqual(shape(run), expected);
+  }
+  // The two runs really were far apart (>= 400 ms, an order of magnitude beyond timer jitter), so the
+  // identical state above is the proof, not the same scenario run twice.
+  assert.ok(lateness.later - lateness.late >= 400,
+    `the two overshoots must differ (${lateness.late} ms vs ${lateness.later} ms past the deadline)`);
 });
 
 test("publication deadline: an expiry re-checked before promotion restores the previous wiki and records rolled-back", async () => {
@@ -1901,7 +1961,15 @@ test("publication deadline: staging is kept until the terminal record is durable
   assert.equal(run.staging, 0, "the bound staging is removed only afterwards, with the worker proven stopped");
   assert.equal(run.manager.isBusy(run.root), false, "the single-flight fence is released only after the job finished");
   // The same ordering holds for the pre-publication expiry: staging survives "validated" and "aborted".
-  const before = await runDeadlinePublication("validated", 250);
+  // Held from the arrival at "validated", so the in-lock re-check (not a pre-validated one spent by a
+  // slow run) is what every atPhase observation below is about.
+  const before = await runDeadlinePublication("validated", 250, { hold: true });
+  assert.ok(before.held.deadlineAfterArrival > 0,
+    `the deadline must be in the future when "validated" is reached; only ${before.held.deadlineAfterArrival} ms were left`);
+  assert.ok(before.held.waited >= before.held.deadlineAfterArrival,
+    `the journal write must finish past the job's deadline (waited ${before.held.waited} ms, deadline was in ${before.held.deadlineAfterArrival} ms)`);
+  assert.ok(before.held.finishedAt - before.held.deadlineAt >= 248,
+    `the journal write must finish about 250 ms past the deadline; it finished ${before.held.finishedAt - before.held.deadlineAt} ms past it`);
   assert.equal(before.atPhase.validated.staging, 1, "staging is still there when validated is durable");
   assert.equal(before.atPhase.aborted.staging, 1, "staging is removed only after aborted is durable");
   assert.equal(before.staging, 0);
