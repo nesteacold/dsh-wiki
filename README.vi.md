@@ -512,8 +512,10 @@ chỉ HTTPS, không đọc config git của user hay hệ thống, không prompt
 `POST /dsh-wiki/api/update` với body `{"confirm":"install-update"}`; thiếu đúng token đó thì update service
 không bao giờ được gọi.
 
-**Reload để hoàn tất.** Một bản cập nhật đã áp dụng **không** restart gì cả. Thẻ báo hãy reload plugin, và
-`reloadRequired` giữ `true` cho tới khi plugin được tạo lại.
+**Khởi động lại DSH để hoàn tất.** Một bản cập nhật đã áp dụng **không** restart gì cả. Thẻ báo hãy khởi động lại DSH, và
+`reloadRequired` giữ `true` cho tới khi plugin được tạo lại — DSH không có reload theo từng plugin (`patchReload: live`
+của nó đọc lại lớp patch mà không khởi tạo lại plugin), và chính một instance plugin mới mới xoá cờ này
+(`lib/update.js:418-421`), nên khởi động lại DSH là bước được hỗ trợ.
 
 **Vì sao bản cài để phát triển bị từ chối.** Một bản cài là symlink — plugin được link vào profile DSH từ một
 checkout phát triển — bị từ chối với `install-is-development-link`, trước khi chạy bất kỳ lệnh git nào. Checkout
@@ -534,7 +536,7 @@ git fetch --tags --prune origin
 git checkout --detach v<version>   # or the tag <version>, or origin/main when no tag exists
 ```
 
-rồi reload plugin. Một bản cài 0.3.1 không thể tự cập nhật qua panel: 0.3.1 có lỗi với annotated tag (postcondition so sánh HEAD với id của tag object chưa được peel, nên mọi lần cập nhật đều bị từ chối với `postcondition-failed` rồi được khôi phục), đã sửa ở 0.3.2. Để đi từ 0.3.1 lên 0.3.2, hãy dùng cách làm thủ công tương đương này với `v0.3.2`. Khoá cấu hình: `update.enabled` (boolean, mặc định `false`; đó là khoá `update` duy nhất và
+rồi khởi động lại DSH. Một bản cài 0.3.1 không thể tự cập nhật qua panel: 0.3.1 có lỗi với annotated tag (postcondition so sánh HEAD với id của tag object chưa được peel, nên mọi lần cập nhật đều bị từ chối với `postcondition-failed` rồi được khôi phục), đã sửa ở 0.3.2. Để đi từ 0.3.1 lên 0.3.2, hãy dùng cách làm thủ công tương đương này với `v0.3.2`. Khoá cấu hình: `update.enabled` (boolean, mặc định `false`; đó là khoá `update` duy nhất và
 mọi khoá khác là lỗi cấu hình). Giới hạn đã biết: đường checkout/restore cho tới nay mới được xác minh với các
 bản giả được tiêm vào, chưa với một repository thật.
 
@@ -623,7 +625,7 @@ node tools/worker-guard-test.mjs        # 61 worker tool-guard checks
 node tools/host-liveness-test.mjs       # 26 host-liveness checks
 node tools/readme-parity-test.mjs       # 127 README parity checks (heading skeleton, byte-identical code blocks, fact tokens, links and anchors, line ratio, no machine paths — across every README translation)
 node tools/update-test.mjs              # 150 update checks (version check + safe self-update: enabled gate, symlink/dirty-tree/origin refusals, downgrade guard, no path or upstream text in payloads, never restarts, single-flight, hardened git config)
-node tools/update-ui-test.mjs <react> <react-dom> # 72 update UI checks (the Version card in every state rendered with real React; requests only on user action; install success only reports a reload)
+node tools/update-ui-test.mjs <react> <react-dom> # 73 update UI checks (the Version card in every state rendered with real React; requests only on user action; install success only says to restart DSH, never that anything was restarted)
 node tools/wiki-freshness-test.mjs      # 39 wiki-freshness checks (changedFiles excludes the wiki dir via git pathspec, stale/behind/unknown semantics, injected fake execFile — no git, no network)
 node tools/recovery-code-projection-test.mjs # 18 recovery-code projection checks (route PLAN_CODES / releaseReason allowlists re-derived from the producers, drift in either direction fails, fail-closed fallback kept)
 ```
