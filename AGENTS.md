@@ -17,8 +17,7 @@ the old monorepo that says `plugins/dsh-wiki/...` means the same path from this 
 | `builder/`, `skills/`, `presets/` | wiki builder, runtime skills, worker preset |
 | `.claude/skills/` | skills for Claude Code users (`wiki-generate`, …) |
 | `tools/` | every test suite and helper (`*-test.mjs`, `register-mcp.mjs`) |
-| `specs/<###-slug>/` | feature specs that belong to this product (numbers kept from the monorepo) |
-| `docs/arch-notes/` | design notes, reviews and run diagnoses for this product |
+| `specs/`, `docs/arch-notes/` | **local only, git-ignored** (owner 2026-11-12): feature specs and design notes live on the maintainer's machine and are never published, because they carry private names and paths. They may be absent in a fresh clone. |
 | `README.md`, `README.zh.md`, `README.vi.md` | user docs; **all three carry the same content** |
 
 ## Read first

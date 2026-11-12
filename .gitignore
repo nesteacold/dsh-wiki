@@ -3,3 +3,7 @@ __pycache__/
 .DS_Store
 *.zip
 .dsh-wiki/
+
+# Internal specs and design notes: kept on this machine only, never published (owner 2026-11-12)
+specs/
+docs/arch-notes/

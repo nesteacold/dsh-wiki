@@ -19,7 +19,9 @@ Do not silently substitute a model when a route fails; report it.
 ## Working process
 
 - Every feature gets `specs/<###-slug>/spec.md` before code. Continue the existing numbering (highest
-  today: 022).
+  today: 022). `specs/` and `docs/arch-notes/` are git-ignored and stay on this machine (owner
+  2026-11-12): never `git add -f` them, and never quote their private names or paths in a commit,
+  README or code comment.
 - Evidence over assertion: report the literal command and its output. A green suite is not a proof —
   `0.3.1` shipped a self-update defect with every suite green; prefer a mutation or a real drill.
 - Commit only the paths you changed: `git commit -- <paths>`.
